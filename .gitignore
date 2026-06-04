@@ -122,4 +122,5 @@ $RECYCLE.BIN/
 *.local.json
 .claude/
 *.md
-!spec.md
+!docs/*.md
+!src/env/
