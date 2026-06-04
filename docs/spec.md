@@ -24,11 +24,9 @@ Spot prices follow a **Geometric Ornstein-Uhlenbeck (GOU) process** to preserve 
 
 The continuous stochastic differential equation is:
 
-
 $$dX_t^i = \theta_i(\mu_i - X_t^i)dt + \sigma_i dW_t^i$$
 
 The exact, drift-free closed-form temporal update $(\Delta t = 1)$ used in the environment step is:
-
 
 $$X_{t+1}^i = \mu_i + (X_t^i - \mu_i)e^{-\theta_i} + \sigma_i \sqrt{\frac{1 - e^{-2\theta_i}}{2\theta_i}} \cdot \epsilon_i \quad \text{where } \epsilon_i \sim N(0,1)$$
 
@@ -36,21 +34,18 @@ Execution spot market price: $S_t^i = \exp(X_t^i)$.
 
 ### 2.3 Market Impact & Slippage
 
-* **Temporary Impact (Friction):** 
+* **Temporary Impact (Friction):**
 $$P_{\text{exec}}^i = S_t^i \cdot (1 + \eta_t q_t^i) \cdot (1 \pm \varphi)$$
 
-
-
 *(where $q_t^i > 0$ represents a buy, and $\varphi$ is the baseline percentage brokerage fee)*.
-* **Permanent Impact (Equilibrium Shift):** 
+
+* **Permanent Impact (Equilibrium Shift):**
+
 $$\mu_i \leftarrow \mu_i + y_i q_t^i$$
-
-
 
 ### 2.4 Fatigue & Catastrophic Expedition Hazards
 
 Party fatigue maps to a continuous domain: $F_t \in [0, 100]$. Active expeditions increment $F_t$, while resting/sedentary steps induce decay. Complete asset forfeiture via catastrophic team failure is tracked via a logistic hazard rate:
-
 
 $$P_{\text{fail}}(F_t, i) = P_{\text{base},i} + \frac{1 - P_{\text{base},i}}{1 + \exp(-\kappa_i(F_t - y_i))}$$
 
