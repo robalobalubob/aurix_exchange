@@ -1,0 +1,125 @@
+# =============================================================================
+# Aurix Exchange Simulation — .gitignore
+# Covers: Python/PyTorch, Godot 4.NET (C#), ONNX exports, and general tooling
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Python
+# -----------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+
+# Testing & coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Jupyter notebooks checkpoints
+.ipynb_checkpoints/
+
+# MyPy / type checking
+.mypy_cache/
+.dmypy.json
+
+# -----------------------------------------------------------------------------
+# PyTorch / Training artifacts
+# -----------------------------------------------------------------------------
+# Checkpoint files — can be large; manage explicitly
+checkpoints/
+*.pt
+*.pth
+
+# TensorBoard logs
+runs/
+logs/
+*.tfevents.*
+
+# -----------------------------------------------------------------------------
+# ONNX exports
+# -----------------------------------------------------------------------------
+# Binary build artifacts — regenerate from training pipeline, don't commit
+exports/*.onnx
+
+# If you ever want to commit a specific blessed model, override with:
+#   git add -f exports/model_v1.onnx
+
+# -----------------------------------------------------------------------------
+# Godot 4
+# -----------------------------------------------------------------------------
+# Godot-generated import cache and metadata
+.godot/
+*.import
+*.uid
+
+# Mono / .NET build artifacts
+godot/.mono/
+godot/bin/
+godot/obj/
+
+# Godot export templates and output
+godot/export_presets.cfg
+godot/exports/
+
+# -----------------------------------------------------------------------------
+# C# / .NET (general)
+# -----------------------------------------------------------------------------
+[Bb]in/
+[Oo]bj/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+.vs/
+*.DotSettings.user
+
+# NuGet
+*.nupkg
+packages/
+project.lock.json
+project.fragment.lock.json
+
+# -----------------------------------------------------------------------------
+# OS & editor noise
+# -----------------------------------------------------------------------------
+# Windows
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# macOS (in case you ever open this on one)
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# VSCode
+.vscode/
+!.vscode/extensions.json
+
+# JetBrains / Rider
+.idea/
+*.iml
+
+# -----------------------------------------------------------------------------
+# Project-specific
+# -----------------------------------------------------------------------------
+# Local environment config — never commit secrets or local paths
+.env
+.env.local
+*.local.json
+.claude/
+*.md
+!spec.md
