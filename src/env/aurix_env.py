@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import math
-from dataclasses import dataclass
+import os
+from dataclasses import asdict, dataclass
 from typing import Optional
 
 import gymnasium as gym
@@ -50,6 +52,9 @@ class EnvConfig:
     # Inventory
     max_inventory: float = 100.0
 
+    # Trade sizing (spec §3.2: BUY allocates exactly 25% of liquid cash)
+    buy_fraction: float = 0.25
+
     # ln(max_expected_cash) — matches C# divisor of 11.5
     cash_norm: float = 11.5
 
@@ -61,6 +66,8 @@ class EnvConfig:
     # Expedition
     expedition_fatigue_gain: float = 15.0
     fatigue_decay_rate: float = 3.0
+    fatigue_max: float = 100.0
+    expedition_fatigue_ceiling: float = 95.0
     expedition_harvest: float = 10.0
     expedition_min_cash: float = 200.0
     # Echo Crystals weight=0: spec forbids harvesting C via expedition
@@ -74,15 +81,19 @@ class EnvConfig:
     # Reward hyperparameters
     reward_alpha: float = 1.0
     reward_clip: float = 1.0
-    reward_gamma: float = 0.99
-    reward_pot_w: float = 0.1
+    # Insolvency defense keys off NET WORTH (true ruin), not raw cash — a cash-poor
+    # but asset-rich agent is solvent and must not be penalised. See spec §3.3.
     insolvency_beta: float = 2.0
-    insolvency_c_crit: float = 500.0
+    insolvency_w_crit: float = 1000.0
     insolvency_omega: float = 10.0
     fatigue_eta: float = 0.01
     fatigue_xi: float = 0.10
     fatigue_f_crit: float = 75.0
     hold_penalty: float = 0.001
+
+    # Action-mask thresholds (must be mirrored by the C# client — see sidecar)
+    buy_cash_epsilon: float = 1e-6
+    sell_inventory_epsilon: float = 1e-9
 
 
 # ---------------------------------------------------------------------------
@@ -216,18 +227,21 @@ class AurixExchangeEnv(gym.Env):
         mask = np.ones(N_ACTIONS, dtype=bool)
 
         # BUY: need enough cash to execute a meaningful trade
-        if self._cash < 1e-6:
+        if self._cash < self.cfg.buy_cash_epsilon:
             mask[BUY_BYRINIUM] = False
             mask[BUY_HERBS] = False
             mask[BUY_CRYSTALS] = False
 
         # SELL: need non-zero inventory
         for action, idx in _SELL_TO_IDX.items():
-            if self._inventory[idx] < 1e-9:
+            if self._inventory[idx] < self.cfg.sell_inventory_epsilon:
                 mask[action] = False
 
         # LAUNCH_EXPEDITION: fatigue ceiling or insufficient cash reserve
-        if self._fatigue >= 95.0 or self._cash < self.cfg.expedition_min_cash:
+        if (
+            self._fatigue >= self.cfg.expedition_fatigue_ceiling
+            or self._cash < self.cfg.expedition_min_cash
+        ):
             mask[LAUNCH_EXPEDITION] = False
 
         return mask
@@ -237,7 +251,7 @@ class AurixExchangeEnv(gym.Env):
     # ------------------------------------------------------------------
 
     def _execute_buy(self, idx: int) -> None:
-        spend = 0.25 * self._cash
+        spend = self.cfg.buy_fraction * self._cash
         S = math.exp(self._log_prices[idx])
         # Approximate qty ignoring impact, then refine exec price
         qty_approx = spend / (S * (1.0 + self.cfg.brokerage_fee))
@@ -280,7 +294,9 @@ class AurixExchangeEnv(gym.Env):
             self.cfg.max_inventory - self._inventory[target],
         )
         self._inventory[target] += harvest
-        self._fatigue = min(100.0, self._fatigue + self.cfg.expedition_fatigue_gain)
+        self._fatigue = min(
+            self.cfg.fatigue_max, self._fatigue + self.cfg.expedition_fatigue_gain
+        )
         return False
 
     def _hazard_rate(self, idx: int) -> float:
@@ -299,25 +315,21 @@ class AurixExchangeEnv(gym.Env):
     def _compute_reward(self, action: int, w_before: float, w_after: float) -> float:
         cfg = self.cfg
 
-        # Clipped log-return
+        # Clipped log-return — the dense wealth-growth signal.
         if w_before > 1e-8:
             log_ret = cfg.reward_alpha * math.log(max(w_after, 1e-8) / w_before)
         else:
             log_ret = -cfg.reward_clip
         clipped = max(-cfg.reward_clip, min(cfg.reward_clip, log_ret))
 
-        # Potential-based shaping: γΦ(s') - Φ(s)
-        phi_after = cfg.reward_pot_w * math.log(max(w_after, 1e-8))
-        phi_before = cfg.reward_pot_w * math.log(max(w_before, 1e-8))
-        shaping = cfg.reward_gamma * phi_after - phi_before
-
-        # Insolvency penalty Ψ_insolvency(C_t)
-        c = self._cash
-        if c <= 0.0:
+        # Insolvency penalty Ψ_insolvency(W_t) — keyed on net worth, not cash, so an
+        # asset-rich/cash-poor agent is not punished for being solvent.
+        w = w_after
+        if w <= 0.0:
             psi_insolvency = cfg.insolvency_omega
-        elif c < cfg.insolvency_c_crit:
+        elif w < cfg.insolvency_w_crit:
             psi_insolvency = cfg.insolvency_beta * (
-                (cfg.insolvency_c_crit - c) / cfg.insolvency_c_crit
+                (cfg.insolvency_w_crit - w) / cfg.insolvency_w_crit
             ) ** 2
         else:
             psi_insolvency = 0.0
@@ -329,7 +341,7 @@ class AurixExchangeEnv(gym.Env):
 
         hold_pen = cfg.hold_penalty if action == HOLD else 0.0
 
-        return clipped + shaping - psi_insolvency - psi_fatigue - hold_pen
+        return clipped - psi_insolvency - psi_fatigue - hold_pen
 
     # ------------------------------------------------------------------
     # Observation
@@ -349,7 +361,7 @@ class AurixExchangeEnv(gym.Env):
                 (self._log_prices[IDX_B] - mu[IDX_B]) / self._sigma_stat[IDX_B],
                 (self._log_prices[IDX_H] - mu[IDX_H]) / self._sigma_stat[IDX_H],
                 (self._log_prices[IDX_C] - mu[IDX_C]) / self._sigma_stat[IDX_C],
-                self._fatigue / 100.0,
+                self._fatigue / cfg.fatigue_max,
                 self._step_count / cfg.t_max,
                 math.log(max(net_worth, 0.0) + 1.0) / cfg.cash_norm,
             ],
@@ -365,3 +377,38 @@ class AurixExchangeEnv(gym.Env):
 
     def _net_worth(self) -> float:
         return float(self._cash + np.dot(self._inventory, np.exp(self._log_prices)))
+
+
+# ---------------------------------------------------------------------------
+# Shared-constants export (single source of truth — see spec Addendum A)
+# ---------------------------------------------------------------------------
+def export_config(cfg: EnvConfig, path: str) -> None:
+    """Serialise the MDP constants to a JSON sidecar.
+
+    This sidecar is the single source of truth shared by the Python training
+    environment and the C# deployment client. The C# observation normaliser and
+    action-mask thresholds read these values rather than hardcoding literals, so
+    the two implementations can never silently drift. Derived quantities
+    (``sigma_stat``, GOU decay/noise) are included so the consumer never recomputes
+    them — ``sigma_stat`` in particular is what the C# price normaliser divides by.
+    """
+    thetas = np.array(cfg.gou_theta, dtype=np.float64)
+    sigmas = np.array(cfg.gou_sigma, dtype=np.float64)
+    sigma_stat = sigmas / np.sqrt(2.0 * thetas)
+    gou_decay = np.exp(-thetas)
+    gou_noise_std = sigmas * np.sqrt((1.0 - np.exp(-2.0 * thetas)) / (2.0 * thetas))
+
+    payload = {
+        "obs_dim": OBS_DIM,
+        "n_actions": N_ACTIONS,
+        "config": asdict(cfg),
+        "derived": {
+            "sigma_stat": sigma_stat.tolist(),
+            "gou_decay": gou_decay.tolist(),
+            "gou_noise_std": gou_noise_std.tolist(),
+        },
+    }
+
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)

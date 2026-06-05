@@ -85,11 +85,12 @@ A 1D discrete action mapping space containing exactly 8 choices:
 
 ### 3.3 The Core Objective Reward Function
 
-$$R_t = \text{clip}\left(\alpha \cdot \ln\left(\frac{W_t}{W_{t-1}}\right), -c, +c\right) + \left(\gamma_{\text{discount}}\Phi(s_{t+1}) - \Phi(s_t)\right) - \Psi_{\text{insolvency}}(C_t) - \Psi_{\text{fatigue}}(F_t) - \delta \cdot \mathbb{1}_{\{a_t = \text{HOLD}\}}$$
+$$R_t = \text{clip}\left(\alpha \cdot \ln\left(\frac{W_t}{W_{t-1}}\right), -c, +c\right) - \Psi_{\text{insolvency}}(W_t) - \Psi_{\text{fatigue}}(F_t) - \delta \cdot \mathbb{1}_{\{a_t = \text{HOLD}\}}$$
 
-* **Potential-Based Field:** $\Phi(s_t) = w \cdot \ln(W_t)$
-* **Insolvency Defense Layer:** $\Psi_{\text{insolvency}}(C_t) = \beta \cdot \left(\frac{C_{\text{crit}} - C_t}{C_{\text{crit}}}\right)^2 \cdot \mathbb{1}_{\{0 < C_t < C_{\text{crit}}\}} + \Omega \cdot \mathbb{1}_{\{C_t \le 0\}}$
+* **Insolvency Defense Layer (net-worth-keyed):** $\Psi_{\text{insolvency}}(W_t) = \beta \cdot \left(\frac{W_{\text{crit}} - W_t}{W_{\text{crit}}}\right)^2 \cdot \mathbb{1}_{\{0 < W_t < W_{\text{crit}}\}} + \Omega \cdot \mathbb{1}_{\{W_t \le 0\}}$
 * **Fatigue Barrier Layer:** $\Psi_{\text{fatigue}}(F_t) = \eta \cdot \exp(\xi(F_t - F_{\text{crit}}))$
+
+> **Revision 2026-06-04:** the potential-based shaping term $\gamma\Phi(s_{t+1}) - \Phi(s_t)$ was **removed**, and the insolvency penalty was **re-keyed from cash $C_t$ to net worth $W_t$**. Decomposing the first trained checkpoint showed both terms were misaligned with the objective: with $\gamma < 1$, the shaping imposed a per-step drag $\approx (1-\gamma)\,w\ln W_t$ that *grew* with wealth, and the cash-based insolvency penalty fired continuously for an asset-rich/cash-poor agent. Together they drove mean episode reward to $-6.2$ despite ~19× net-worth growth. The clipped log-return already supplies a dense growth signal, so shaping is unnecessary; $\Psi_{\text{insolvency}}$ now only activates near true ruin ($W_t < W_{\text{crit}}$, default $W_{\text{crit}} = 1000$).
 
 ---
 
@@ -193,3 +194,106 @@ public class PalanDecisionEngine : IDisposable
 }
 
 ```
+
+> **Note:** the numeric literals in `GetNormalizedVector()` above (`11.5f`, `6.9f`,
+> `0.5f`, `100.0f`, …) are *illustrative*. In production they must be loaded from the
+> shared-constants sidecar defined in **Addendum A**, not hardcoded — otherwise the C#
+> normaliser will silently drift from the Python training distribution whenever an env
+> parameter changes.
+
+---
+
+## 5. Addendum A — Shared-Constants Sidecar (Normative)
+
+The observation normaliser and action-mask thresholds are duplicated across two
+implementations: the Python training environment (`src/env/aurix_env.py`) and the C#
+deployment client (`PalanDecisionEngine` / `MarketEnvironmentState`). Any divergence in
+these constants means the deployed model receives a different observation distribution
+than it trained on — a silent, hard-to-diagnose correctness failure.
+
+To eliminate that risk, **all MDP constants are owned by the Python `EnvConfig` dataclass
+and serialised to a JSON sidecar** at training/export time via `export_config()`. The
+sidecar is written next to the model artifacts (default `exports/aurix_config.json`) and
+is the single source of truth.
+
+**Schema:**
+
+```json
+{
+  "obs_dim": 10,
+  "n_actions": 8,
+  "config": { "...": "every EnvConfig field, including buy_fraction, fatigue_max, expedition_fatigue_ceiling, buy_cash_epsilon, sell_inventory_epsilon" },
+  "derived": {
+    "sigma_stat":    [0.5, 0.15, 0.9],
+    "gou_decay":     ["e^-theta per commodity"],
+    "gou_noise_std": ["closed-form per-step noise std per commodity"]
+  }
+}
+```
+
+**Consumer contract:**
+
+* The C# client loads the sidecar once at startup and reads `cash_norm`,
+  `max_inventory`, `gou_mu`, and `derived.sigma_stat` for the normaliser, and
+  `expedition_fatigue_ceiling`, `expedition_min_cash`, `buy_cash_epsilon`,
+  `sell_inventory_epsilon` for the action-mask reconstruction.
+* `derived.sigma_stat` is provided precomputed because the C# normaliser divides log-price
+  deviations by it directly; the consumer must **not** recompute it from `sigma`/`theta`.
+* The sidecar and the `.onnx` are a versioned pair — shipping one without regenerating the
+  other is forbidden.
+
+---
+
+## 6. Addendum B — Multiplayer / Competitive Extension (Forward-Looking, Non-Normative)
+
+This addendum sketches a future direction in which trained agents are embedded in the
+Godot client to *play* the market — either for deployment-environment evaluation or for
+competitive multi-agent scenarios. **It is non-normative:** the core training MDP (§1–§3)
+remains a stationary, single-agent process. Nothing here changes the current pipeline.
+
+### 6.1 Prerequisite — the game must become the environment
+
+The current C# surface implements only the *consumer* of the policy (normaliser +
+masked-argmax inference). To run an episode in-engine, the **market dynamics themselves**
+must be ported to C#: the GOU step (§2.2), trade execution with temporary/permanent impact
+(§2.3), and the fatigue/expedition hazard (§2.4). Until that port exists, agents cannot
+"play" — they can only score externally-supplied observations.
+
+Three parity surfaces must match the Python env exactly:
+
+| Surface | Python source of truth | C# status |
+| --- | --- | --- |
+| Observation normalisation | `_normalize_obs()` | exists (`GetNormalizedVector`) |
+| Action masking | `_action_mask()` | **missing** — must be reconstructed from sidecar thresholds |
+| Market dynamics | `_gou_step` / `_execute_*` | **missing** — must be ported |
+
+### 6.2 Validation strategy
+
+Cross-language bit-exactness is not achievable (NumPy PCG64 vs. C# RNG, differing float
+ops), so parity is validated in two decoupled halves:
+
+1. **Inference parity (export correctness):** feed recorded Python observations through both
+   the PyTorch net and the ONNX session; assert Q-values agree to ~`1e-4`. Independent of
+   any RNG.
+2. **Dynamics parity (port correctness):** drive both simulators with an identical action
+   sequence and, where shareable, identical noise; assert trajectories track. Otherwise
+   fall back to statistical comparison of return distributions across many seeds.
+
+Both are best expressed as golden-trajectory fixtures generated from Python and asserted
+against in C#.
+
+### 6.3 The stationarity break (competitive case)
+
+The single-agent MDP assumes a stationary market in which permanent impact
+(`mu ← mu + y·q`) is driven by one agent. Placing *N* agents in one shared market violates
+this: impact sums across agents and the environment each agent observes becomes
+non-stationary. Two tiers follow:
+
+* **Drop-in (available once §6.1 is done):** instantiate multiple `PalanDecisionEngine`s
+  against one shared market. Agents will trade and the result is a compelling
+  visualisation, but each was trained believing it acts alone — expect degraded or unstable
+  behaviour when rivals move prices. Suitable for demos and qualitative evaluation only.
+* **Genuinely competitive (research-level):** retrain under a multi-agent regime
+  (independent learners, self-play, or PSRO-style population training) with the market
+  modelled as multi-agent from the outset. This is a different training pipeline from the
+  current Double-DQN-vs-stationary-GOU setup and a substantially larger undertaking.

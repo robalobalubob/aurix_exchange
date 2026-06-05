@@ -7,8 +7,9 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn as nn
+from tqdm import tqdm
 
-from src.env.aurix_env import AurixExchangeEnv, N_ACTIONS, OBS_DIM
+from src.env.aurix_env import AurixExchangeEnv, N_ACTIONS, OBS_DIM, export_config
 from src.models.dqn import DuelingDQN
 from src.training.replay_buffer import PrioritizedReplayBuffer
 
@@ -44,6 +45,7 @@ class TrainConfig:
     # Bookkeeping
     log_every: int = 1_000
     checkpoint_path: str = "exports/dqn_checkpoint.pt"
+    config_path: str = "exports/aurix_config.json"
     seed: Optional[int] = 0
 
 
@@ -134,8 +136,16 @@ def train(cfg: TrainConfig) -> DuelingDQN:
     loss_count = 0
     episode_return = 0.0
     episode_returns: list[float] = []
+    best_avg_return = float("-inf")
 
-    for step in range(1, cfg.total_steps + 1):
+    pbar = tqdm(
+        range(1, cfg.total_steps + 1),
+        desc="train",
+        unit="step",
+        dynamic_ncols=True,
+        smoothing=0.05,
+    )
+    for step in pbar:
         eps = _linear_anneal(
             cfg.eps_start, cfg.eps_end, step / cfg.eps_decay_steps
         )
@@ -185,15 +195,32 @@ def train(cfg: TrainConfig) -> DuelingDQN:
             avg_loss = running_loss / max(loss_count, 1)
             recent = episode_returns[-20:]
             avg_ret = float(np.mean(recent)) if recent else float("nan")
-            print(
+            if recent and avg_ret > best_avg_return:
+                best_avg_return = avg_ret
+
+            # Live metrics on the bar itself; full line written above it.
+            pbar.set_postfix(
+                eps=f"{eps:.3f}",
+                loss=f"{avg_loss:.4f}",
+                ret=f"{avg_ret:.2f}",
+                best=f"{best_avg_return:.2f}",
+                buf=len(buffer),
+                ep=len(episode_returns),
+                refresh=False,
+            )
+            pbar.write(
                 f"step {step:>7} | eps {eps:5.3f} | "
                 f"loss {avg_loss:8.5f} | avg_return {avg_ret:8.3f} | "
-                f"buffer {len(buffer):>6}"
+                f"best {best_avg_return:8.3f} | "
+                f"buffer {len(buffer):>6} | episodes {len(episode_returns):>5}"
             )
             running_loss = 0.0
             loss_count = 0
 
+    pbar.close()
     _save_checkpoint(online, cfg.checkpoint_path)
+    export_config(env.cfg, cfg.config_path)
+    print(f"saved config sidecar -> {cfg.config_path}")
     return online
 
 

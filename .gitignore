@@ -53,6 +53,7 @@ logs/
 # -----------------------------------------------------------------------------
 # Binary build artifacts — regenerate from training pipeline, don't commit
 exports/*.onnx
+exports/
 
 # If you ever want to commit a specific blessed model, override with:
 #   git add -f exports/model_v1.onnx
