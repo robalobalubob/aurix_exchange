@@ -23,16 +23,17 @@ from src.env.aurix_env import (
     AurixExchangeEnv,
     EnvConfig,
     N_ACTIONS,
+    N_PHASES,
     OBS_DIM,
     HOLD,
     BUY_BYRINIUM,
     SELL_BYRINIUM,
     BUY_HERBS,
-    BUY_CRYSTALS,
+    BUY_TOOLS,
     LAUNCH_EXPEDITION,
     IDX_B,
     IDX_H,
-    IDX_C,
+    IDX_T,
 )
 
 # Seed used wherever a test needs reproducible randomness.
@@ -175,13 +176,21 @@ def test_norm_cash_index_0(env: AurixExchangeEnv, cfg: EnvConfig) -> None:
 
 @pytest.mark.correctness
 def test_norm_inventory_indices_1_to_3(env: AurixExchangeEnv, cfg: EnvConfig) -> None:
-    """Indices 1-3 = inventory / Max_Capacity; full inventory maps to exactly 1.0."""
+    """Indices 1-3 = inventory / per-commodity Max_Capacity; full inventory maps to 1.0."""
     env.reset()
-    env._inventory[:] = cfg.max_inventory
+    # Per-commodity capacities differ now (B=500, H=2500, T=100).
+    env._inventory[:] = env._max_inventory
     obs = env._normalize_obs()
     assert obs[1] == pytest.approx(1.0, rel=1e-6)
     assert obs[2] == pytest.approx(1.0, rel=1e-6)
     assert obs[3] == pytest.approx(1.0, rel=1e-6)
+
+    # Half capacity maps to 0.5 for each, confirming the divisor is per-commodity.
+    env._inventory[:] = env._max_inventory * 0.5
+    obs = env._normalize_obs()
+    assert obs[1] == pytest.approx(0.5, rel=1e-6)
+    assert obs[2] == pytest.approx(0.5, rel=1e-6)
+    assert obs[3] == pytest.approx(0.5, rel=1e-6)
 
     env._inventory[:] = 0.0
     obs = env._normalize_obs()
@@ -201,7 +210,7 @@ def test_norm_price_indices_4_to_6(env: AurixExchangeEnv) -> None:
     sigma_stat = env._sigma_stat
     mu = env._gou_mu
 
-    for k, idx in [(2.0, IDX_B), (-2.0, IDX_H), (0.0, IDX_C)]:
+    for k, idx in [(2.0, IDX_B), (-2.0, IDX_H), (0.0, IDX_T)]:
         env._log_prices[idx] = mu[idx] + k * sigma_stat[idx]
     obs = env._normalize_obs()
     assert obs[4] == pytest.approx(2.0, rel=1e-5)
@@ -210,33 +219,37 @@ def test_norm_price_indices_4_to_6(env: AurixExchangeEnv) -> None:
 
 
 @pytest.mark.correctness
-def test_norm_fatigue_step_networth_indices_7_to_9(
+def test_norm_fatigue_phase_cooldown_indices_7_to_9(
     env: AurixExchangeEnv, cfg: EnvConfig
 ) -> None:
-    """Index 7 = F/100, index 8 = t/T_max, index 9 = ln(W + 1)/ln(Max_Expected_Cash).
+    """Index 7 = F/100, index 8 = phase τ/(N_PHASES-1), index 9 = cooldown/max.
 
-    Boundary values: fatigue at 0 and 100, step at 0 and T_max.
+    Per rebalancing.md §3.1 the step and net-worth features were repurposed to the
+    phase index and expedition cooldown respectively.
     """
     env.reset()
 
+    # Fatigue full; Night phase (τ=3) and cooldown at its ceiling both map to 1.0.
     env._fatigue = 100.0
-    env._step_count = cfg.t_max
+    env._step_count = N_PHASES - 1  # τ = 3 -> Night
+    env._cooldown = cfg.expedition_cooldown_steps
     obs = env._normalize_obs()
     assert obs[7] == pytest.approx(1.0, rel=1e-6)
     assert obs[8] == pytest.approx(1.0, rel=1e-6)
+    assert obs[9] == pytest.approx(1.0, rel=1e-6)
 
     env._fatigue = 0.0
-    env._step_count = 0
+    env._step_count = 0  # τ = 0 -> Morning
+    env._cooldown = 0
     obs = env._normalize_obs()
     assert obs[7] == 0.0
     assert obs[8] == 0.0
+    assert obs[9] == 0.0
 
-    # Net-worth index against a known cash-only portfolio.
-    env._cash = 5_000.0
-    env._inventory[:] = 0.0
-    net_worth = env._net_worth()
+    # Phase cycles every N_PHASES steps; τ=1 (Day) maps to 1/3.
+    env._step_count = N_PHASES + 1
     obs = env._normalize_obs()
-    assert obs[9] == pytest.approx(math.log(net_worth + 1.0) / cfg.cash_norm, rel=1e-5)
+    assert obs[8] == pytest.approx(1.0 / (N_PHASES - 1), rel=1e-6)
 
 
 # ===========================================================================
@@ -358,7 +371,7 @@ def test_buy_masked_when_cash_empty(env: AurixExchangeEnv) -> None:
     mask = env._action_mask()
     assert mask[BUY_BYRINIUM] == False  # noqa: E712
     assert mask[BUY_HERBS] == False  # noqa: E712
-    assert mask[BUY_CRYSTALS] == False  # noqa: E712
+    assert mask[BUY_TOOLS] == False  # noqa: E712
 
 
 @pytest.mark.correctness
@@ -571,18 +584,22 @@ def test_sell_execution_price_below_spot(env: AurixExchangeEnv) -> None:
 
 
 @pytest.mark.correctness
-def test_buy_raises_equilibrium_mu(env: AurixExchangeEnv, cfg: EnvConfig) -> None:
-    """Permanent impact: buying Byrinium shifts mu_B up by y_B * q (buy pressure)."""
+def test_trades_do_not_move_equilibrium_mu(env: AurixExchangeEnv) -> None:
+    """Anti-self-inflation (rebalancing.md §2.1): permanent impact is removed, so
+    neither a BUY nor a SELL may shift the reversion target mu (closing the exploit
+    where the agent could ratchet its own asset prices up indefinitely).
+    """
     env.reset()
     env._cash = 10_000.0
     env._inventory[:] = 0.0
-    mu_before = env._gou_mu[IDX_B]
+    mu_before = env._gou_mu.copy()
 
     env._execute_buy(IDX_B)
-    qty = env._inventory[IDX_B]
-    expected_mu = mu_before + cfg.perm_impact[IDX_B] * qty
-    assert env._gou_mu[IDX_B] == pytest.approx(expected_mu, rel=1e-9)
-    assert env._gou_mu[IDX_B] > mu_before
+    np.testing.assert_allclose(env._gou_mu, mu_before, rtol=0.0, atol=0.0)
+
+    env._inventory[IDX_H] = 50.0
+    env._execute_sell(IDX_H)
+    np.testing.assert_allclose(env._gou_mu, mu_before, rtol=0.0, atol=0.0)
 
 
 # ===========================================================================
@@ -634,6 +651,148 @@ def test_fatigue_clamped_to_range(env: AurixExchangeEnv) -> None:
 
 
 # ===========================================================================
+# 7b. Phase-Based Action Masking (rebalancing.md §2.2 / §3.2)
+# ===========================================================================
+@pytest.mark.correctness
+def test_night_curfew_masks_buys_and_expedition(env: AurixExchangeEnv) -> None:
+    """Night phase (τ=3) must mask all BUY actions and LAUNCH_EXPEDITION (§3.2)."""
+    env.reset()
+    env._cash = 10_000.0
+    env._inventory[:] = 10.0  # ensure sells/buys would otherwise be valid
+    env._fatigue = 0.0
+    env._cooldown = 0
+    env._step_count = 3  # τ = 3 -> Night
+    mask = env._action_mask()
+    assert mask[BUY_BYRINIUM] == False  # noqa: E712
+    assert mask[BUY_HERBS] == False  # noqa: E712
+    assert mask[BUY_TOOLS] == False  # noqa: E712
+    assert mask[LAUNCH_EXPEDITION] == False  # noqa: E712
+    # SELL and HOLD remain available at night.
+    assert mask[HOLD] == True  # noqa: E712
+    assert mask[SELL_BYRINIUM] == True  # noqa: E712
+
+
+@pytest.mark.correctness
+def test_daytime_phase_allows_buys(env: AurixExchangeEnv) -> None:
+    """Control: outside the night curfew, BUYs and expeditions are available."""
+    env.reset()
+    env._cash = 10_000.0
+    env._fatigue = 0.0
+    env._cooldown = 0
+    env._step_count = 0  # τ = 0 -> Morning
+    mask = env._action_mask()
+    assert mask[BUY_BYRINIUM] == True  # noqa: E712
+    assert mask[LAUNCH_EXPEDITION] == True  # noqa: E712
+
+
+# ===========================================================================
+# 7c. Expedition Refactor: fee, localized failure, cooldown (§2.3)
+# ===========================================================================
+@pytest.mark.correctness
+def test_launch_fee_scales_with_fatigue(env: AurixExchangeEnv, cfg: EnvConfig) -> None:
+    """The upfront launch fee is base at F=0 and base·(1+k) at F=fatigue_max."""
+    env.reset()
+    env._fatigue = 0.0
+    assert env._launch_fee() == pytest.approx(cfg.launch_fee_base, rel=1e-9)
+
+    env._fatigue = cfg.fatigue_max
+    expected = cfg.launch_fee_base * (1.0 + cfg.launch_fee_fatigue_k)
+    assert env._launch_fee() == pytest.approx(expected, rel=1e-9)
+
+
+@pytest.mark.correctness
+def test_expedition_pays_fee_regardless_of_outcome(env: AurixExchangeEnv) -> None:
+    """The launch fee is deducted on a failed expedition too (paid upfront, §2.3)."""
+    env.reset()
+    env._cash = 5_000.0
+    env._fatigue = 0.0
+    env._inventory[:] = 0.0
+    fee = env._launch_fee()
+    env._hazard_rate = lambda idx: 1.0  # force catastrophic-roll failure
+    failed = env._execute_expedition()
+    assert failed is True
+    assert env._cash == pytest.approx(5_000.0 - fee, rel=1e-9)
+
+
+@pytest.mark.correctness
+def test_expedition_failure_is_localized(env: AurixExchangeEnv) -> None:
+    """Localized failure (§2.3): cash beyond the fee and node inventory are preserved.
+
+    The legacy behaviour zeroed all cash and inventory; that must no longer happen.
+    """
+    env.reset()
+    env._cash = 5_000.0
+    env._fatigue = 0.0
+    env._inventory[:] = np.array([12.0, 34.0, 5.0])
+    inv_before = env._inventory.copy()
+    env._hazard_rate = lambda idx: 1.0
+    failed = env._execute_expedition()
+    assert failed is True
+    assert env._cash > 0.0  # not wiped out
+    np.testing.assert_array_equal(env._inventory, inv_before)  # inventory untouched
+
+
+@pytest.mark.correctness
+def test_expedition_failure_does_not_terminate(env: AurixExchangeEnv) -> None:
+    """A failed expedition must not terminate the episode (only truncation ends it)."""
+    env.reset()
+    env._cash = 5_000.0
+    env._fatigue = 0.0
+    env._step_count = 0
+    env._cooldown = 0
+    env._hazard_rate = lambda idx: 1.0
+    _, _, terminated, truncated, info = env.step(LAUNCH_EXPEDITION)
+    assert terminated is False
+    assert truncated is False
+    assert info["cooldown"] == EnvConfig().expedition_cooldown_steps
+
+
+@pytest.mark.correctness
+def test_cooldown_locks_out_then_releases_expedition(env: AurixExchangeEnv, cfg: EnvConfig) -> None:
+    """After a failed expedition the cooldown blocks LAUNCH for exactly N steps.
+
+    The info cooldown counter must decrement 2 -> 1 -> 0, and the action mask must
+    block LAUNCH_EXPEDITION while the counter is non-zero.
+    """
+    env.reset()
+    env._cash = 10_000.0
+    env._fatigue = 0.0
+    env._step_count = 0
+    env._cooldown = 0
+    env._hazard_rate = lambda idx: 1.0
+
+    _, _, _, _, info = env.step(LAUNCH_EXPEDITION)
+    assert info["cooldown"] == cfg.expedition_cooldown_steps
+    assert info["action_mask"][LAUNCH_EXPEDITION] == False  # noqa: E712
+
+    observed = [info["cooldown"]]
+    for _ in range(cfg.expedition_cooldown_steps):
+        _, _, _, _, info = env.step(HOLD)
+        observed.append(info["cooldown"])
+        if info["cooldown"] > 0:
+            assert info["action_mask"][LAUNCH_EXPEDITION] == False  # noqa: E712
+    assert observed == [2, 1, 0]
+
+    # With the cooldown cleared (and a non-night, well-funded state) LAUNCH unlocks.
+    env._cooldown = 0
+    env._step_count = 0
+    env._cash = 10_000.0
+    env._fatigue = 0.0
+    assert env._action_mask()[LAUNCH_EXPEDITION] == True  # noqa: E712
+
+
+@pytest.mark.correctness
+def test_expedition_masked_during_cooldown(env: AurixExchangeEnv, cfg: EnvConfig) -> None:
+    """A non-zero cooldown alone is sufficient to mask LAUNCH_EXPEDITION."""
+    env.reset()
+    env._cash = 10_000.0
+    env._fatigue = 0.0
+    env._step_count = 0
+    env._cooldown = 1
+    assert env._action_mask()[LAUNCH_EXPEDITION] == False  # noqa: E712
+
+
+# ===========================================================================
 # 8. Episode Termination
 # ===========================================================================
 @pytest.mark.correctness
@@ -665,7 +824,9 @@ def test_not_done_before_t_max(env: AurixExchangeEnv, cfg: EnvConfig) -> None:
 def test_reset_observation_baseline() -> None:
     """Lock the seeded reset() observation against a captured baseline.
 
-    Generated 2026-06-04 from AurixExchangeEnv(seed=42).reset(seed=42).
+    Regenerated 2026-06-06 for the rebalancing.md §1/§3.1 alignment (Tools commodity,
+    per-commodity capacity, idx 8 = phase, idx 9 = cooldown) from
+    AurixExchangeEnv(seed=42).reset(seed=42).
     """
     # REGRESSION BASELINE — update this array intentionally if env parameters change.
     # Do not update automatically; verify the change is deliberate.
@@ -680,7 +841,7 @@ def test_reset_observation_baseline() -> None:
             0.7504512071609497,
             0.0,
             0.0,
-            0.8009078502655029,
+            0.0,
         ],
         dtype=np.float32,
     )
@@ -697,12 +858,12 @@ def test_cumulative_reward_baseline() -> None:
     """Lock cumulative reward over a fixed action sequence against a captured baseline.
 
     Generated 2026-06-04: seed=42, 10 steps alternating BUY_BYRINIUM / SELL_BYRINIUM.
-    Regenerated 2026-06-04 after the reward revision (shaping removed, insolvency
-    re-keyed to net worth).
+    Regenerated 2026-06-06 for the rebalancing.md alignment (new B risk-ladder
+    params: μ=ln(150), θ=0.10, σ=0.40; permanent impact removed).
     """
     # REGRESSION BASELINE — update this value intentionally if env parameters change.
     # Do not update automatically; verify the change is deliberate.
-    expected_cumulative = -0.09258204557173393
+    expected_cumulative = -0.16781596354977363
 
     env = AurixExchangeEnv(seed=_SEED)
     env.reset(seed=_SEED)
@@ -724,11 +885,12 @@ def test_gou_step_output_baseline() -> None:
     Generated 2026-06-04: AurixExchangeEnv(seed=7).reset(seed=7), then the RNG is
     replaced with default_rng(999) before a single _gou_step(). Guards the
     closed-form implementation against accidental refactoring.
+    Regenerated 2026-06-06 for the rebalancing.md §1 GOU parameter rescale.
     """
     # REGRESSION BASELINE — update this array intentionally if env parameters change.
     # Do not update automatically; verify the change is deliberate.
     expected = np.array(
-        [7.063549177090335, 3.3679516659319146, 8.3959685557604],
+        [5.303196766463923, 3.36914904759407, 5.690647641653602],
         dtype=np.float64,
     )
     env = AurixExchangeEnv(seed=7)

@@ -18,20 +18,23 @@ BUY_BYRINIUM = 1
 SELL_BYRINIUM = 2
 BUY_HERBS = 3
 SELL_HERBS = 4
-BUY_CRYSTALS = 5
-SELL_CRYSTALS = 6
+BUY_TOOLS = 5
+SELL_TOOLS = 6
 LAUNCH_EXPEDITION = 7
 
 N_ACTIONS = 8
 OBS_DIM = 10
+N_PHASES = 4
 
-# Commodity indices
+# Commodity indices (rebalancing.md §1: Echo Crystals removed, Refined Tools added)
 IDX_B = 0
 IDX_H = 1
-IDX_C = 2
+IDX_T = 2
 
-_BUY_TO_IDX: dict[int, int] = {BUY_BYRINIUM: IDX_B, BUY_HERBS: IDX_H, BUY_CRYSTALS: IDX_C}
-_SELL_TO_IDX: dict[int, int] = {SELL_BYRINIUM: IDX_B, SELL_HERBS: IDX_H, SELL_CRYSTALS: IDX_C}
+_BUY_TO_IDX: dict[int, int] = {BUY_BYRINIUM: IDX_B, BUY_HERBS: IDX_H, BUY_TOOLS: IDX_T}
+_SELL_TO_IDX: dict[int, int] = {SELL_BYRINIUM: IDX_B, SELL_HERBS: IDX_H, SELL_TOOLS: IDX_T}
+# BUY/SELL action indices, used by the night-curfew action mask.
+_BUY_ACTIONS: tuple[int, ...] = (BUY_BYRINIUM, BUY_HERBS, BUY_TOOLS)
 
 
 # ---------------------------------------------------------------------------
@@ -43,14 +46,15 @@ class EnvConfig:
     t_max: int = 200
     initial_cash: float = 10_000.0
 
-    # GOU parameters per commodity [B, H, C]
-    # σ_stat = σ / sqrt(2θ) must match C# normalizer: B=0.50, H=0.15, C=0.90
-    gou_mu: tuple[float, ...] = (6.9, 3.4, 9.2)
+    # GOU parameters per commodity [B, H, T] (rebalancing.md §1 risk-ladder).
+    # μ = ln(base price): B=ln(150), H=ln(30), T=ln(600).
+    # σ_stat = σ / sqrt(2θ) is the C# price-normalizer divisor: B≈0.894, H=0.15, T≈0.791.
+    gou_mu: tuple[float, ...] = (5.0106352940962555, 3.4011973816621555, 6.396929655216146)
     gou_theta: tuple[float, ...] = (0.10, 0.50, 0.05)
-    gou_sigma: tuple[float, ...] = (0.22361, 0.15000, 0.28460)
+    gou_sigma: tuple[float, ...] = (0.40, 0.15, 0.25)
 
-    # Inventory
-    max_inventory: float = 100.0
+    # Per-commodity carrying capacity I_max [B, H, T] (rebalancing.md §1).
+    max_inventory: tuple[float, ...] = (500.0, 2500.0, 100.0)
 
     # Trade sizing (spec §3.2: BUY allocates exactly 25% of liquid cash)
     buy_fraction: float = 0.25
@@ -58,10 +62,10 @@ class EnvConfig:
     # ln(max_expected_cash) — matches C# divisor of 11.5
     cash_norm: float = 11.5
 
-    # Market impact
+    # Market impact. Permanent impact (μ ← μ + y·q) removed per rebalancing.md §2.1
+    # to close the self-inflation exploit; μ is now static at baseline.
     brokerage_fee: float = 0.01
     temp_impact: float = 0.002
-    perm_impact: tuple[float, ...] = (0.0001, 0.00005, 0.0005)
 
     # Expedition
     expedition_fatigue_gain: float = 15.0
@@ -70,7 +74,13 @@ class EnvConfig:
     expedition_fatigue_ceiling: float = 95.0
     expedition_harvest: float = 10.0
     expedition_min_cash: float = 200.0
-    # Echo Crystals weight=0: spec forbids harvesting C via expedition
+    # Upfront launch fee, paid on every launch regardless of outcome (rebalancing.md
+    # §2.3). Scales with party fatigue: fee = base · (1 + k · F / fatigue_max).
+    launch_fee_base: float = 100.0
+    launch_fee_fatigue_k: float = 1.0
+    # Localized-failure cooldown: steps during which LAUNCH_EXPEDITION is masked.
+    expedition_cooldown_steps: int = 2
+    # Tools weight=0: expeditions source raw goods only; Tools are manufactured (Phase B).
     expedition_weights: tuple[float, ...] = (0.5, 0.5, 0.0)
 
     # Hazard function P_fail(F, i) = p_base + (1-p_base) / (1 + exp(-κ(F - midpoint)))
@@ -130,15 +140,20 @@ class AurixExchangeEnv(gym.Env):
         self._expedition_weights = np.array(self.cfg.expedition_weights, dtype=np.float64)
         self._expedition_weights /= self._expedition_weights.sum()
 
+        # Per-commodity carrying capacity, as an array for vectorised normalisation.
+        self._max_inventory: np.ndarray = np.array(self.cfg.max_inventory, dtype=np.float64)
+
         self._rng = np.random.default_rng(seed)
 
-        # Mutable state — initialised in reset()
+        # Mutable state — initialised in reset(). μ is immutable now (no permanent
+        # impact), so it is set once here and never mutated.
         self._log_prices: np.ndarray = np.zeros(3, dtype=np.float64)
         self._gou_mu: np.ndarray = np.array(self.cfg.gou_mu, dtype=np.float64)
         self._cash: float = 0.0
         self._inventory: np.ndarray = np.zeros(3, dtype=np.float64)
         self._fatigue: float = 0.0
         self._step_count: int = 0
+        self._cooldown: int = 0
 
     # ------------------------------------------------------------------
     # Public API
@@ -163,6 +178,7 @@ class AurixExchangeEnv(gym.Env):
         self._inventory = np.zeros(3, dtype=np.float64)
         self._fatigue = 0.0
         self._step_count = 0
+        self._cooldown = 0
 
         obs = self._normalize_obs()
         info = {"action_mask": self._action_mask(), "net_worth": self._net_worth()}
@@ -174,7 +190,7 @@ class AurixExchangeEnv(gym.Env):
             action = HOLD
 
         w_before = self._net_worth()
-        terminated = False
+        expedition_failed = False
 
         if action == HOLD:
             self._apply_fatigue_decay()
@@ -185,14 +201,25 @@ class AurixExchangeEnv(gym.Env):
             self._execute_sell(_SELL_TO_IDX[action])
             self._apply_fatigue_decay()
         elif action == LAUNCH_EXPEDITION:
-            terminated = self._execute_expedition()
+            expedition_failed = self._execute_expedition()
 
         self._gou_step()
         self._step_count += 1
 
+        # Cooldown bookkeeping (rebalancing.md §2.3): a failed expedition this step
+        # arms the cooldown; otherwise an active cooldown ages by one step. The mask
+        # at the top of step() already read the pre-decrement value, so blocking
+        # spans exactly `expedition_cooldown_steps` subsequent steps.
+        if expedition_failed:
+            self._cooldown = self.cfg.expedition_cooldown_steps
+        elif self._cooldown > 0:
+            self._cooldown -= 1
+
         w_after = self._net_worth()
         reward = self._compute_reward(action, w_before, w_after)
 
+        # Localized failure is not catastrophic — episodes end only by truncation.
+        terminated = False
         truncated = self._step_count >= self.cfg.t_max
         obs = self._normalize_obs()
         info = {
@@ -200,6 +227,7 @@ class AurixExchangeEnv(gym.Env):
             "net_worth": w_after,
             "cash": self._cash,
             "fatigue": self._fatigue,
+            "cooldown": self._cooldown,
         }
         return obs, reward, terminated, truncated, info
 
@@ -223,25 +251,36 @@ class AurixExchangeEnv(gym.Env):
     # Action masking
     # ------------------------------------------------------------------
 
+    def _phase(self) -> int:
+        """Time-of-day phase τ ∈ {0=Morning, 1=Day, 2=Evening, 3=Night} (§2.2)."""
+        return self._step_count % N_PHASES
+
     def _action_mask(self) -> np.ndarray:
         mask = np.ones(N_ACTIONS, dtype=bool)
 
         # BUY: need enough cash to execute a meaningful trade
         if self._cash < self.cfg.buy_cash_epsilon:
-            mask[BUY_BYRINIUM] = False
-            mask[BUY_HERBS] = False
-            mask[BUY_CRYSTALS] = False
+            for action in _BUY_ACTIONS:
+                mask[action] = False
 
         # SELL: need non-zero inventory
         for action, idx in _SELL_TO_IDX.items():
             if self._inventory[idx] < self.cfg.sell_inventory_epsilon:
                 mask[action] = False
 
-        # LAUNCH_EXPEDITION: fatigue ceiling or insufficient cash reserve
+        # LAUNCH_EXPEDITION: cooldown lockout, fatigue ceiling, or insufficient
+        # cash reserve (the reserve covers the worst-case fatigue-scaled launch fee).
         if (
-            self._fatigue >= self.cfg.expedition_fatigue_ceiling
+            self._cooldown > 0
+            or self._fatigue >= self.cfg.expedition_fatigue_ceiling
             or self._cash < self.cfg.expedition_min_cash
         ):
+            mask[LAUNCH_EXPEDITION] = False
+
+        # Night curfew (§3.2): no open-market purchases and no expeditions.
+        if self._phase() == 3:
+            for action in _BUY_ACTIONS:
+                mask[action] = False
             mask[LAUNCH_EXPEDITION] = False
 
         return mask
@@ -257,13 +296,12 @@ class AurixExchangeEnv(gym.Env):
         qty_approx = spend / (S * (1.0 + self.cfg.brokerage_fee))
         exec_price = S * (1.0 + self.cfg.temp_impact * qty_approx) * (1.0 + self.cfg.brokerage_fee)
         qty = spend / exec_price
-        # Clamp to remaining capacity
-        qty = min(qty, self.cfg.max_inventory - self._inventory[idx])
+        # Clamp to remaining per-commodity capacity
+        qty = min(qty, self._max_inventory[idx] - self._inventory[idx])
         actual_cost = qty * exec_price
 
         self._cash -= actual_cost
         self._inventory[idx] += qty
-        self._gou_mu[idx] += self.cfg.perm_impact[idx] * qty
 
     def _execute_sell(self, idx: int) -> None:
         qty = self._inventory[idx]
@@ -274,29 +312,40 @@ class AurixExchangeEnv(gym.Env):
 
         self._cash += proceeds
         self._inventory[idx] = 0.0
-        self._gou_mu[idx] -= self.cfg.perm_impact[idx] * qty
 
     # ------------------------------------------------------------------
     # Expedition
     # ------------------------------------------------------------------
 
+    def _launch_fee(self) -> float:
+        """Upfront launch cost, scaling with party fatigue (rebalancing.md §2.3)."""
+        return self.cfg.launch_fee_base * (
+            1.0 + self.cfg.launch_fee_fatigue_k * self._fatigue / self.cfg.fatigue_max
+        )
+
     def _execute_expedition(self) -> bool:
+        """Run a sourcing expedition. Returns True on localized (non-catastrophic)
+        failure, which arms the cooldown but never forfeits cash or node inventory.
+        """
+        # Upfront fee is paid regardless of outcome.
+        self._cash = max(0.0, self._cash - self._launch_fee())
+        # The trip is taken either way, so fatigue accrues either way.
+        self._fatigue = min(
+            self.cfg.fatigue_max, self._fatigue + self.cfg.expedition_fatigue_gain
+        )
+
         target = int(self._rng.choice(3, p=self._expedition_weights))
 
         if self._rng.random() < self._hazard_rate(target):
-            # Catastrophic failure — complete asset forfeiture
-            self._cash = 0.0
-            self._inventory[:] = 0.0
+            # Localized failure: pending harvest is lost (nothing added); cooldown
+            # is armed by the caller. Cash and existing inventory are untouched.
             return True
 
         harvest = min(
             self.cfg.expedition_harvest,
-            self.cfg.max_inventory - self._inventory[target],
+            self._max_inventory[target] - self._inventory[target],
         )
         self._inventory[target] += harvest
-        self._fatigue = min(
-            self.cfg.fatigue_max, self._fatigue + self.cfg.expedition_fatigue_gain
-        )
         return False
 
     def _hazard_rate(self, idx: int) -> float:
@@ -350,20 +399,23 @@ class AurixExchangeEnv(gym.Env):
     def _normalize_obs(self) -> np.ndarray:
         cfg = self.cfg
         mu = self._gou_mu
-        net_worth = self._net_worth()
+        cap = self._max_inventory
 
+        # obs layout (rebalancing.md §3.1): idx 8 repurposed to phase τ/3, idx 9 to
+        # expedition cooldown / max. Net worth is no longer observed (tracked only
+        # inside the reward).
         obs = np.array(
             [
                 math.log(max(self._cash, 0.0) + 1.0) / cfg.cash_norm,
-                self._inventory[IDX_B] / cfg.max_inventory,
-                self._inventory[IDX_H] / cfg.max_inventory,
-                self._inventory[IDX_C] / cfg.max_inventory,
+                self._inventory[IDX_B] / cap[IDX_B],
+                self._inventory[IDX_H] / cap[IDX_H],
+                self._inventory[IDX_T] / cap[IDX_T],
                 (self._log_prices[IDX_B] - mu[IDX_B]) / self._sigma_stat[IDX_B],
                 (self._log_prices[IDX_H] - mu[IDX_H]) / self._sigma_stat[IDX_H],
-                (self._log_prices[IDX_C] - mu[IDX_C]) / self._sigma_stat[IDX_C],
+                (self._log_prices[IDX_T] - mu[IDX_T]) / self._sigma_stat[IDX_T],
                 self._fatigue / cfg.fatigue_max,
-                self._step_count / cfg.t_max,
-                math.log(max(net_worth, 0.0) + 1.0) / cfg.cash_norm,
+                self._phase() / (N_PHASES - 1),
+                self._cooldown / cfg.expedition_cooldown_steps,
             ],
             dtype=np.float32,
         )
