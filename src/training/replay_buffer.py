@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Optional
+
 import numpy as np
 
 OBS_DIM = 10
@@ -66,12 +68,16 @@ class PrioritizedReplayBuffer:
         alpha: float = 0.6,
         eps: float = 1e-6,
         obs_dim: int = OBS_DIM,
+        rng: Optional[np.random.Generator] = None,
     ) -> None:
         self.capacity = capacity
         self.n_actions = n_actions
         self.alpha = alpha
         self.eps = eps
         self.obs_dim = obs_dim
+        # Own RNG so identical-seed runs are reproducible — the legacy global
+        # np.random.uniform here was the one place that broke determinism.
+        self._rng = rng if rng is not None else np.random.default_rng()
 
         self._tree = SumTree(capacity)
         self._max_priority = 1.0
@@ -126,7 +132,7 @@ class PrioritizedReplayBuffer:
             # Stratified sampling: one draw per equal-probability segment
             lo = segment * k
             hi = segment * (k + 1)
-            value = np.random.uniform(lo, hi)
+            value = self._rng.uniform(lo, hi)
             leaf_idx, priority = self._tree.get(value)
             indices[k] = leaf_idx
             priorities[k] = priority

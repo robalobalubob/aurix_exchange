@@ -11,6 +11,7 @@ from tqdm import tqdm
 
 from src.env.aurix_env import AurixExchangeEnv, N_ACTIONS, OBS_DIM, export_config
 from src.models.dqn import DuelingDQN
+from src.training.evaluate import evaluate_net
 from src.training.replay_buffer import PrioritizedReplayBuffer
 
 # Large negative fill for masked-out action Q-values prior to argmax / max.
@@ -44,9 +45,17 @@ class TrainConfig:
 
     # Bookkeeping
     log_every: int = 1_000
-    checkpoint_path: str = "exports/dqn_checkpoint.pt"
+    # ``checkpoint_path`` is the always-saved last checkpoint; ``best_path`` is saved
+    # only when the periodic greedy seeded eval improves (save-best, not save-last).
+    checkpoint_path: str = "exports/dqn_last.pt"
+    best_path: str = "exports/dqn_best.pt"
     config_path: str = "exports/aurix_config.json"
     seed: Optional[int] = 0
+
+    # Periodic greedy, seeded evaluation that drives save-best (deterministic).
+    eval_every: int = 10_000
+    eval_episodes: int = 200
+    eval_seed0: int = 10_000
 
 
 def _linear_anneal(start: float, end: float, frac: float) -> float:
@@ -115,7 +124,10 @@ def compute_loss(
 
 
 def train(cfg: TrainConfig) -> DuelingDQN:
-    rng = np.random.default_rng(cfg.seed)
+    # Independent child streams for action selection and the PER buffer, both derived
+    # from cfg.seed so the whole run is reproducible (see replay_buffer seeding fix).
+    act_seed, buf_seed = np.random.SeedSequence(cfg.seed).spawn(2)
+    rng = np.random.default_rng(act_seed)
     torch.manual_seed(cfg.seed if cfg.seed is not None else 0)
 
     env = AurixExchangeEnv(seed=cfg.seed)
@@ -126,7 +138,8 @@ def train(cfg: TrainConfig) -> DuelingDQN:
 
     optimizer = torch.optim.Adam(online.parameters(), lr=cfg.lr)
     buffer = PrioritizedReplayBuffer(
-        cfg.buffer_capacity, N_ACTIONS, alpha=cfg.per_alpha
+        cfg.buffer_capacity, N_ACTIONS, alpha=cfg.per_alpha,
+        rng=np.random.default_rng(buf_seed),
     )
 
     obs, info = env.reset()
@@ -136,7 +149,9 @@ def train(cfg: TrainConfig) -> DuelingDQN:
     loss_count = 0
     episode_return = 0.0
     episode_returns: list[float] = []
-    best_avg_return = float("-inf")
+    # Save-best signal: median terminal net worth from the greedy seeded eval, not the
+    # noisy last-20-training-episodes window (which was tracked but never acted on).
+    best_eval_score = float("-inf")
 
     pbar = tqdm(
         range(1, cfg.total_steps + 1),
@@ -190,20 +205,39 @@ def train(cfg: TrainConfig) -> DuelingDQN:
         if step % cfg.target_sync == 0:
             target.load_state_dict(online.state_dict())
 
+        # Periodic greedy seeded evaluation -> save-best. Done after warmup, when the
+        # policy is worth evaluating.
+        if step >= cfg.warmup_steps and step % cfg.eval_every == 0:
+            metrics = evaluate_net(
+                online,
+                n_episodes=cfg.eval_episodes,
+                seed0=cfg.eval_seed0,
+                config=env.cfg,
+            )
+            online.train()  # evaluate_net() puts the net in eval mode
+            score = metrics["nw_median"]
+            if score > best_eval_score:
+                best_eval_score = score
+                _save_checkpoint(online, cfg.best_path)
+            pbar.write(
+                f"step {step:>7} | EVAL median_nw {score:>12,.0f} "
+                f"({metrics['median_growth_x']:.2f}x) | "
+                f"bankruptcy {metrics['bankruptcy_rate']:.1%} | "
+                f"best_nw {best_eval_score:>12,.0f}"
+            )
+
         # Log
         if step % cfg.log_every == 0:
             avg_loss = running_loss / max(loss_count, 1)
             recent = episode_returns[-20:]
             avg_ret = float(np.mean(recent)) if recent else float("nan")
-            if recent and avg_ret > best_avg_return:
-                best_avg_return = avg_ret
 
             # Live metrics on the bar itself; full line written above it.
             pbar.set_postfix(
                 eps=f"{eps:.3f}",
                 loss=f"{avg_loss:.4f}",
                 ret=f"{avg_ret:.2f}",
-                best=f"{best_avg_return:.2f}",
+                best_nw=f"{best_eval_score:,.0f}",
                 buf=len(buffer),
                 ep=len(episode_returns),
                 refresh=False,
@@ -211,15 +245,19 @@ def train(cfg: TrainConfig) -> DuelingDQN:
             pbar.write(
                 f"step {step:>7} | eps {eps:5.3f} | "
                 f"loss {avg_loss:8.5f} | avg_return {avg_ret:8.3f} | "
-                f"best {best_avg_return:8.3f} | "
                 f"buffer {len(buffer):>6} | episodes {len(episode_returns):>5}"
             )
             running_loss = 0.0
             loss_count = 0
 
     pbar.close()
+    # Always save the last checkpoint; best.pt holds the best eval seen during training.
     _save_checkpoint(online, cfg.checkpoint_path)
+    if best_eval_score == float("-inf"):
+        # Training never reached an eval (e.g. total_steps < warmup); best == last.
+        _save_checkpoint(online, cfg.best_path)
     export_config(env.cfg, cfg.config_path)
+    print(f"saved last -> {cfg.checkpoint_path}, best -> {cfg.best_path}")
     print(f"saved config sidecar -> {cfg.config_path}")
     return online
 

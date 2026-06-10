@@ -35,20 +35,19 @@ def _greedy_action(net: DuelingDQN, obs: np.ndarray, mask: np.ndarray) -> int:
         return int(torch.argmax(q, dim=1).item())
 
 
-def evaluate(
-    checkpoint_path: str,
+def evaluate_net(
+    net: DuelingDQN,
     n_episodes: int = 500,
     seed0: int = 10_000,
     config: EnvConfig | None = None,
 ) -> dict:
-    """Run the greedy policy over ``n_episodes`` seeded episodes and collect metrics.
+    """Greedy, fully seeded evaluation of an in-memory network.
 
-    Returns a dict of summary statistics; does not print. Each episode uses a
-    distinct seed so the result reflects the policy across many market draws.
+    Deterministic: greedy policy, fixed seed block, no global-RNG dependence. This is
+    the shared eval machinery used both by the CLI (via ``evaluate``) and by the
+    trainer's save-best signal, so the two can never measure different things.
     """
     cfg = config or EnvConfig()
-    net = DuelingDQN(obs_dim=OBS_DIM, n_actions=N_ACTIONS)
-    net.load_state_dict(torch.load(checkpoint_path))
     net.eval()
 
     final_net_worth = np.empty(n_episodes, dtype=np.float64)
@@ -86,6 +85,18 @@ def evaluate(
         "reward_mean": float(np.mean(episode_reward)),
         "action_counts": dict(action_counts.most_common()),
     }
+
+
+def evaluate(
+    checkpoint_path: str,
+    n_episodes: int = 500,
+    seed0: int = 10_000,
+    config: EnvConfig | None = None,
+) -> dict:
+    """Load a checkpoint from disk and evaluate it (CLI entry path)."""
+    net = DuelingDQN(obs_dim=OBS_DIM, n_actions=N_ACTIONS)
+    net.load_state_dict(torch.load(checkpoint_path))
+    return evaluate_net(net, n_episodes=n_episodes, seed0=seed0, config=config)
 
 
 def _print_report(m: dict) -> None:
