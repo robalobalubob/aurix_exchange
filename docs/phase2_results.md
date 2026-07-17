@@ -3,6 +3,15 @@
 **Status:** Policy-gradient rungs complete (REINFORCE, A2C, PPO — 2026-07-11).
 Remaining Phase 2 menu: continuous control (SAC/DDPG), model-based (MCTS, Dyna)
 with sample-efficiency curves.
+
+> **M1 protocol note (2026-07-16):** These are historical, exploratory
+> single-training-seed results. Their final reports reused the `10_000+`
+> validation path block, and their rollout confidence intervals do not measure
+> retraining variability. Claims below about algorithm families or overlapping
+> intervals are therefore provisional. The locked M1 study retrains seeds 0–4,
+> selects checkpoints on `10_000+`, and reports once on held-out `100_000+`
+> paths; see `docs/m1_protocol.md`.
+
 Every rung runs on the *identical* clean core (canonical single-asset Byrinium
 instance, config hash `c7e2adda5358b757`, E_z[V\*_0] = **6.6385**) and is scored by
 the same CRN regret harness against the same DP ground truth as Phase 1

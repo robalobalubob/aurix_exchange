@@ -17,7 +17,11 @@ import torch
 from src.env.ou_core import OUCoreConfig, OUTradingEnv
 from src.models.policy import ActorCriticNet
 from src.training.train_a2c import a2c_loss, gae, normalize
-from src.training.train_reinforce import collect_batch, greedy_policy, returns_to_go
+from src.training.train_reinforce import (
+    collect_batch,
+    greedy_policy,
+    returns_to_go,
+)
 
 _CFG = OUCoreConfig(t_max=20)
 
@@ -52,7 +56,7 @@ def test_gae_matches_definition(gamma, lam):
 
 @pytest.mark.correctness
 def test_gae_lambda_one_recovers_monte_carlo_advantage():
-    """At lambda=1 the GAE telescopes to G_t - V(s_t) regardless of the critic."""
+    """At lambda=1, GAE telescopes to G_t - V(s_t)."""
     rng = np.random.default_rng(1)
     rewards = rng.normal(size=(15, 4))
     values = rng.normal(size=(15, 4))

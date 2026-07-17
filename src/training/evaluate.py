@@ -1,13 +1,12 @@
 """Greedy-policy evaluation harness for the Aurix Exchange agent.
 
-Summed episode reward is a poor quality signal (it mixes wealth growth with
-penalty terms), so this harness reports the metric that actually matters: the
-distribution of terminal net worth, plus the bankruptcy rate. Run after training
-to judge a checkpoint, and to compare reward-function changes before/after.
+Summed episode reward is a poor quality signal because it mixes wealth growth
+with penalty terms. This harness instead reports terminal net-worth statistics
+and bankruptcy rate. Run it after training to judge a checkpoint or compare
+reward-function changes.
 
 Usage:
-    python -m src.training.evaluate
-    python -m src.training.evaluate --checkpoint exports/dqn_checkpoint.pt --episodes 500
+    python -m src.training.evaluate --checkpoint <run-directory>/best.pt
 """
 from __future__ import annotations
 
@@ -22,7 +21,7 @@ from src.models.dqn import DuelingDQN
 
 # Matches the training mask fill so greedy selection ignores invalid actions.
 _MASK_FILL = -1.0e9
-# Terminal net worth below this counts as ruin (catastrophic failure zeroes assets).
+# Terminal net worth below this counts as ruin.
 _RUIN_THRESHOLD = 1.0
 
 
@@ -43,9 +42,8 @@ def evaluate_net(
 ) -> dict:
     """Greedy, fully seeded evaluation of an in-memory network.
 
-    Deterministic: greedy policy, fixed seed block, no global-RNG dependence. This is
-    the shared eval machinery used both by the CLI (via ``evaluate``) and by the
-    trainer's save-best signal, so the two can never measure different things.
+    This is deterministic: greedy policy, fixed seed block, and no global RNG.
+    The CLI and trainer share it so they cannot measure different outcomes.
     """
     cfg = config or EnvConfig()
     net.eval()
@@ -95,7 +93,13 @@ def evaluate(
 ) -> dict:
     """Load a checkpoint from disk and evaluate it (CLI entry path)."""
     net = DuelingDQN(obs_dim=OBS_DIM, n_actions=N_ACTIONS)
-    net.load_state_dict(torch.load(checkpoint_path))
+    net.load_state_dict(
+        torch.load(
+            checkpoint_path,
+            map_location="cpu",
+            weights_only=True,
+        )
+    )
     return evaluate_net(net, n_episodes=n_episodes, seed0=seed0, config=config)
 
 
@@ -104,7 +108,10 @@ def _print_report(m: dict) -> None:
     print(f"episodes              {m['n_episodes']}")
     print(f"start net worth       {m['start_net_worth']:>12,.0f}")
     print(f"final net worth mean  {m['nw_mean']:>12,.0f}")
-    print(f"final net worth median{m['nw_median']:>12,.0f}  ({m['median_growth_x']:.2f}x)")
+    print(
+        f"final net worth median{m['nw_median']:>12,.0f}  "
+        f"({m['median_growth_x']:.2f}x)"
+    )
     print(f"  P10 / P90           {m['nw_p10']:>12,.0f} / {m['nw_p90']:,.0f}")
     print(f"bankruptcy rate       {m['bankruptcy_rate']:>11.1%}")
     print(f"loss rate (< start)   {m['loss_rate']:>11.1%}")
@@ -113,13 +120,23 @@ def _print_report(m: dict) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate a trained Aurix agent.")
-    parser.add_argument("--checkpoint", default="exports/dqn_checkpoint.pt")
+    parser = argparse.ArgumentParser(
+        description="Evaluate a trained Aurix agent."
+    )
+    parser.add_argument(
+        "--checkpoint",
+        required=True,
+        help="Path to a dqn_game run's best.pt or last.pt checkpoint.",
+    )
     parser.add_argument("--episodes", type=int, default=500)
     parser.add_argument("--seed0", type=int, default=10_000)
     args = parser.parse_args()
 
-    metrics = evaluate(args.checkpoint, n_episodes=args.episodes, seed0=args.seed0)
+    metrics = evaluate(
+        args.checkpoint,
+        n_episodes=args.episodes,
+        seed0=args.seed0,
+    )
     _print_report(metrics)
 
 

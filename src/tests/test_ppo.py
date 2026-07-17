@@ -29,7 +29,9 @@ def _fresh_batch(seed: int, n_envs: int = 4):
     torch.manual_seed(seed)
     net = ActorCriticNet(obs_dim=_CFG.obs_dim, n_actions=_CFG.n_actions)
     envs = [OUTradingEnv(config=_CFG) for _ in range(n_envs)]
-    obs, actions, rewards = collect_batch(net, envs, np.random.default_rng(seed))
+    obs, actions, rewards = collect_batch(
+        net, envs, np.random.default_rng(seed)
+    )
     obs_t = torch.from_numpy(obs.reshape(-1, _CFG.obs_dim))
     act_t = torch.from_numpy(actions.reshape(-1))
     with torch.no_grad():
@@ -51,7 +53,9 @@ def test_ratio_one_recovers_plain_policy_gradient():
         net, obs, act, old_lp, adv, target,
         clip_eps=0.2, value_coef=0.0, entropy_coef=0.0,
     )
-    assert float(loss.item()) == pytest.approx(float(-adv.mean().item()), abs=1e-6)
+    assert float(loss.item()) == pytest.approx(
+        float(-adv.mean().item()), abs=1e-6
+    )
     assert clip_fraction == 0.0
     assert 0.0 < entropy <= np.log(_CFG.n_actions) + 1e-6
 
@@ -92,5 +96,6 @@ def test_ppo_update_moves_parameters_and_is_finite():
         opt.step()
         assert np.isfinite(float(loss.item()))
     assert any(
-        not torch.equal(b, p.detach()) for b, p in zip(before, net.parameters())
+        not torch.equal(before_param, param.detach())
+        for before_param, param in zip(before, net.parameters())
     )

@@ -1,4 +1,4 @@
-"""Train PPO on the clean OU trading core — Phase 2, third policy-gradient rung.
+"""Train PPO on the clean OU core — Phase 2, third policy-gradient rung.
 
 The step up from A2C is sample reuse under a trust region: each batch of
 episodes is consumed for several epochs of minibatched updates, with the
@@ -8,8 +8,8 @@ harness, and save-best rule are all identical to the A2C rung — the ladder
 isolates the algorithmic change (roadmap v2, Phase 2).
 
 Advantages are normalized per minibatch (the standard PPO convention), and the
-clip fraction — the share of samples where the ratio clip is active — is logged
-as the trust-region diagnostic.
+clip fraction — the share of samples where the ratio clip is active — is
+logged as the trust-region diagnostic.
 
 Usage:
     python -m src.training.train_ppo
@@ -18,7 +18,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from typing import Optional
 
 import numpy as np
@@ -31,9 +31,15 @@ from tqdm import tqdm
 from src.env.ou_core import OUCoreConfig, OUTradingEnv
 from src.models.policy import ActorCriticNet
 from src.solvers import dp, regret
+from src.training.artifacts import create_run, file_sha256
 from src.training.train_a2c import gae
 from src.training.train_core import solve_or_load
-from src.training.train_reinforce import _save, collect_batch, greedy_policy
+from src.training.train_reinforce import (
+    _save,
+    collect_batch,
+    greedy_policy,
+    held_out_seed_intervals,
+)
 
 
 @dataclass(frozen=True)
@@ -60,11 +66,15 @@ class TrainPPOConfig:
     eval_episodes: int = 500
     final_eval_episodes: int = 5_000
     eval_seed0: int = 10_000
+    test_seed0: int = 100_000
+    # Keep training market paths disjoint from model-selection and test paths.
+    # This field is serialized with every run, making the rule auditable.
+    exclude_evaluation_seed_blocks_from_training: bool = True
 
     # Bookkeeping
     log_every: int = 5
-    checkpoint_path: str = "exports/ppo_last.pt"
-    best_path: str = "exports/ppo_best.pt"
+    artifact_root: str = "exports/runs"
+    run_id: Optional[str] = None
     dp_cache_dir: str = "exports"
     seed: Optional[int] = 0
 
@@ -89,8 +99,8 @@ def ppo_loss(
             + value_coef * MSE(V, target) - entropy_coef * H,
         r = pi(a|s) / pi_old(a|s).
 
-    Returns (loss, mean-entropy, clip-fraction) — clip fraction is the share of
-    samples where the ratio clip binds, the trust-region health diagnostic.
+    Returns (loss, mean-entropy, clip-fraction). Clip fraction is the share of
+    samples where the ratio clip binds, a trust-region health diagnostic.
     """
     logits, values = net(obs)
     dist = Categorical(logits=logits)
@@ -109,23 +119,52 @@ def ppo_loss(
 # ---------------------------------------------------------------------------
 def train(cfg: TrainPPOConfig) -> tuple[ActorCriticNet, regret.RegretReport]:
     core = cfg.core
+    evaluation_seed_intervals = held_out_seed_intervals(
+        cfg.eval_seed0,
+        cfg.eval_episodes,
+        cfg.test_seed0,
+        cfg.final_eval_episodes,
+    )
+    reserved_training_seeds = (
+        evaluation_seed_intervals
+        if cfg.exclude_evaluation_seed_blocks_from_training
+        else ()
+    )
     torch.manual_seed(cfg.seed if cfg.seed is not None else 0)
     rng = np.random.default_rng(cfg.seed)
 
-    # Ground truth + precomputed pi* returns on the eval seed block (paired regret).
+    # Ground truth plus pi* returns on the validation seeds (paired regret).
     res = solve_or_load(core, dp.DPGrid(), cfg.dp_cache_dir)
+    run = create_run(
+        "ppo_core",
+        seed=cfg.seed,
+        training_config=cfg,
+        environment_config=core,
+        root=cfg.artifact_root,
+        run_id=cfg.run_id,
+        metadata={"dp_config_hash": res.config_hash},
+    )
+    print(f"Run artifacts: {run.run_directory}")
     eval_seeds = regret.make_seed_block(cfg.eval_episodes, cfg.eval_seed0)
-    pistar_eval_returns, _ = regret.rollout(regret.from_dp(res), core, eval_seeds)
+    pistar_eval_returns, _ = regret.rollout(
+        regret.from_dp(res), core, eval_seeds
+    )
 
     envs = [OUTradingEnv(config=core) for _ in range(cfg.batch_episodes)]
     net = ActorCriticNet(obs_dim=core.obs_dim, n_actions=core.n_actions)
     optimizer = torch.optim.Adam(net.parameters(), lr=cfg.lr)
 
     best_regret = float("inf")
+    best_validation_step: int | None = None
     pbar = tqdm(range(1, cfg.total_updates + 1), desc="train_ppo",
                 unit="update", dynamic_ncols=True, smoothing=0.05)
     for update in pbar:
-        obs_b, act_b, rew_b = collect_batch(net, envs, rng)
+        obs_b, act_b, rew_b = collect_batch(
+            net,
+            envs,
+            rng,
+            reserved_seed_intervals=reserved_training_seeds,
+        )
         n_samples = rew_b.size
         obs_t = torch.from_numpy(obs_b.reshape(-1, core.obs_dim))
         act_t = torch.from_numpy(act_b.reshape(-1))
@@ -137,9 +176,17 @@ def train(cfg: TrainPPOConfig) -> tuple[ActorCriticNet, regret.RegretReport]:
         values = values_t.numpy().astype(np.float64).reshape(rew_b.shape)
         adv, value_targets = gae(rew_b, values, core.gamma, cfg.gae_lambda)
         adv_t = torch.from_numpy(adv.reshape(-1).astype(np.float32))
-        target_t = torch.from_numpy(value_targets.reshape(-1).astype(np.float32))
+        target_t = torch.from_numpy(
+            value_targets.reshape(-1).astype(np.float32)
+        )
+        value_loss_before_update = float(
+            F.mse_loss(values_t, target_t).item()
+        )
 
-        entropy, clip_fraction = 0.0, 0.0
+        loss_total = 0.0
+        entropy_total = 0.0
+        clip_fraction_total = 0.0
+        minibatch_count = 0
         for _ in range(cfg.epochs):
             perm = torch.from_numpy(rng.permutation(n_samples))
             for start in range(0, n_samples, cfg.minibatch_size):
@@ -155,6 +202,19 @@ def train(cfg: TrainPPOConfig) -> tuple[ActorCriticNet, regret.RegretReport]:
                 loss.backward()
                 nn.utils.clip_grad_norm_(net.parameters(), cfg.grad_clip)
                 optimizer.step()
+                loss_total += float(loss.item())
+                entropy_total += entropy
+                clip_fraction_total += clip_fraction
+                minibatch_count += 1
+
+        if minibatch_count:
+            mean_loss = loss_total / minibatch_count
+            entropy = entropy_total / minibatch_count
+            clip_fraction = clip_fraction_total / minibatch_count
+        else:
+            mean_loss = 0.0
+            entropy = 0.0
+            clip_fraction = 0.0
 
         if update % cfg.eval_every == 0:
             rep = regret.evaluate_regret(
@@ -162,16 +222,53 @@ def train(cfg: TrainPPOConfig) -> tuple[ActorCriticNet, regret.RegretReport]:
                 seed0=cfg.eval_seed0, pistar_returns=pistar_eval_returns,
             )
             net.train()
-            if rep.regret < best_regret:
+            selected_as_best = rep.regret < best_regret
+            validation_checkpoint = None
+            if selected_as_best:
                 best_regret = rep.regret
-                _save(net, cfg.best_path)
+                best_validation_step = update
+                _save(net, run.best_checkpoint_path)
+                validation_checkpoint = {
+                    "path": run.best_checkpoint_path.name,
+                    "sha256": file_sha256(run.best_checkpoint_path),
+                    "selected_validation_step": update,
+                }
+            validation_metrics = asdict(rep)
+            validation_metrics["selected_as_best"] = selected_as_best
+            run.append_metrics(
+                step=update,
+                split="validation",
+                metrics=validation_metrics,
+                metadata=(
+                    {"selected_checkpoint": validation_checkpoint}
+                    if validation_checkpoint is not None
+                    else None
+                ),
+            )
             pbar.write(
                 f"update {update:>5} | EVAL regret {rep.regret:7.4f} "
                 f"(paired {rep.paired_regret:7.4f} +/- {rep.paired_ci:.4f}) | "
-                f"agree {rep.agreement_rate:.1%} | best_regret {best_regret:7.4f}"
+                f"agree {rep.agreement_rate:.1%} | "
+                f"best_regret {best_regret:7.4f}"
             )
 
         if update % cfg.log_every == 0:
+            run.append_metrics(
+                step=update,
+                split="train",
+                metrics={
+                    "loss": mean_loss,
+                    "mean_episode_return": float(
+                        rew_b.sum(axis=0).mean()
+                    ),
+                    "entropy": entropy,
+                    "value_loss_before_update": value_loss_before_update,
+                    "clip_fraction": clip_fraction,
+                    "best_validation_regret": (
+                        best_regret if np.isfinite(best_regret) else None
+                    ),
+                },
+            )
             pbar.set_postfix(
                 mean_return=f"{rew_b.sum(axis=0).mean():.3f}",
                 entropy=f"{entropy:.3f}", clip=f"{clip_fraction:.2f}",
@@ -179,16 +276,70 @@ def train(cfg: TrainPPOConfig) -> tuple[ActorCriticNet, regret.RegretReport]:
             )
 
     pbar.close()
-    _save(net, cfg.checkpoint_path)
+    _save(net, run.last_checkpoint_path)
     if best_regret == float("inf"):
-        _save(net, cfg.best_path)
+        rep = regret.evaluate_regret(
+            greedy_policy(net),
+            res,
+            n_episodes=cfg.eval_episodes,
+            seed0=cfg.eval_seed0,
+            pistar_returns=pistar_eval_returns,
+        )
+        net.train()
+        best_regret = rep.regret
+        best_validation_step = cfg.total_updates
+        _save(net, run.best_checkpoint_path)
+        validation_metrics = asdict(rep)
+        validation_metrics["selected_as_best"] = True
+        run.append_metrics(
+            step=cfg.total_updates,
+            split="validation",
+            metrics=validation_metrics,
+            metadata={
+                "selected_checkpoint": {
+                    "path": run.best_checkpoint_path.name,
+                    "sha256": file_sha256(run.best_checkpoint_path),
+                    "selected_validation_step": cfg.total_updates,
+                }
+            },
+        )
 
-    # Ladder entry: evaluate the best checkpoint at full resolution.
+    assert best_validation_step is not None
+    selected_checkpoint = {
+        "path": run.best_checkpoint_path.name,
+        "sha256": file_sha256(run.best_checkpoint_path),
+        "selected_validation_step": best_validation_step,
+    }
+
+    # The validation block selected this checkpoint. Score it once on a
+    # disjoint held-out seed block for an unbiased ladder report.
     best = ActorCriticNet(obs_dim=core.obs_dim, n_actions=core.n_actions)
-    best.load_state_dict(torch.load(cfg.best_path))
+    best.load_state_dict(
+        torch.load(
+            run.best_checkpoint_path,
+            map_location="cpu",
+            weights_only=True,
+        )
+    )
     final = regret.evaluate_regret(
         greedy_policy(best), res, n_episodes=cfg.final_eval_episodes,
-        seed0=cfg.eval_seed0,
+        seed0=cfg.test_seed0,
+    )
+    run.append_metrics(
+        step=cfg.total_updates,
+        split="test",
+        metrics=asdict(final),
+        metadata={"selected_checkpoint": selected_checkpoint},
+    )
+    run.finish(
+        summary={
+            "best_validation_regret": (
+                best_regret if np.isfinite(best_regret) else None
+            ),
+            "test": asdict(final),
+            "dp_config_hash": res.config_hash,
+            "selected_checkpoint": selected_checkpoint,
+        },
     )
     print("\n=== PPO on clean core - Phase 2 ladder entry ===")
     print(f"config hash {res.config_hash}")
@@ -197,8 +348,12 @@ def train(cfg: TrainPPOConfig) -> tuple[ActorCriticNet, regret.RegretReport]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train PPO on the clean OU core.")
-    parser.add_argument("--updates", type=int, default=TrainPPOConfig.total_updates)
+    parser = argparse.ArgumentParser(
+        description="Train PPO on the clean OU core."
+    )
+    parser.add_argument(
+        "--updates", type=int, default=TrainPPOConfig.total_updates
+    )
     parser.add_argument("--batch-episodes", type=int,
                         default=TrainPPOConfig.batch_episodes)
     parser.add_argument("--seed", type=int, default=0)

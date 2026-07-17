@@ -9,8 +9,14 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
-from src.env.aurix_env import AurixExchangeEnv, N_ACTIONS, OBS_DIM, export_config
+from src.env.aurix_env import (
+    AurixExchangeEnv,
+    N_ACTIONS,
+    OBS_DIM,
+    export_config,
+)
 from src.models.dqn import DuelingDQN
+from src.training.artifacts import create_run
 from src.training.evaluate import evaluate_net
 from src.training.replay_buffer import PrioritizedReplayBuffer
 
@@ -43,19 +49,20 @@ class TrainConfig:
     eps_end: float = 0.05
     eps_decay_steps: int = 50_000
 
-    # Bookkeeping
+    # Experiment bookkeeping. Every invocation receives its own directory, so
+    # checkpoints from one seed or configuration cannot overwrite another.
     log_every: int = 1_000
-    # ``checkpoint_path`` is the always-saved last checkpoint; ``best_path`` is saved
-    # only when the periodic greedy seeded eval improves (save-best, not save-last).
-    checkpoint_path: str = "exports/dqn_last.pt"
-    best_path: str = "exports/dqn_best.pt"
-    config_path: str = "exports/aurix_config.json"
+    artifact_root: str = "exports/runs"
+    run_id: Optional[str] = None
     seed: Optional[int] = 0
 
-    # Periodic greedy, seeded evaluation that drives save-best (deterministic).
+    # Periodic validation drives model selection. The final test block is
+    # deliberately disjoint so it remains an honest held-out measurement.
     eval_every: int = 10_000
     eval_episodes: int = 200
     eval_seed0: int = 10_000
+    test_episodes: int = 500
+    test_seed0: int = 100_000
 
 
 def _linear_anneal(start: float, end: float, frac: float) -> float:
@@ -93,7 +100,7 @@ def compute_loss(
     batch: dict,
     gamma: float,
 ) -> tuple[torch.Tensor, np.ndarray]:
-    """Double DQN loss with action-masked targets. Returns (loss, td_errors)."""
+    """Return Double DQN loss and TD errors with action-masked targets."""
     obs = torch.as_tensor(batch["obs"], dtype=torch.float32)
     actions = torch.as_tensor(batch["actions"], dtype=torch.int64)
     rewards = torch.as_tensor(batch["rewards"], dtype=torch.float32)
@@ -123,14 +130,38 @@ def compute_loss(
     return loss, td_errors.detach().cpu().numpy()
 
 
+def _artifact_eval_metrics(metrics: dict) -> dict:
+    """Make evaluator output safe for the strict artifact JSON contract."""
+    normalized = dict(metrics)
+    normalized["action_counts"] = {
+        str(action): count
+        for action, count in metrics["action_counts"].items()
+    }
+    return normalized
+
+
 def train(cfg: TrainConfig) -> DuelingDQN:
-    # Independent child streams for action selection and the PER buffer, both derived
-    # from cfg.seed so the whole run is reproducible (see replay_buffer seeding fix).
+    # Independent child streams for action selection and the PER buffer are
+    # derived from cfg.seed so the whole run is reproducible.
     act_seed, buf_seed = np.random.SeedSequence(cfg.seed).spawn(2)
     rng = np.random.default_rng(act_seed)
     torch.manual_seed(cfg.seed if cfg.seed is not None else 0)
 
     env = AurixExchangeEnv(seed=cfg.seed)
+    run = create_run(
+        "dqn_game",
+        seed=cfg.seed,
+        training_config=cfg,
+        environment_config=env.cfg,
+        root=cfg.artifact_root,
+        run_id=cfg.run_id,
+        metadata={
+            "environment": "AurixExchangeEnv",
+            "selection_metric": "validation.nw_median",
+        },
+    )
+    print(f"run artifacts -> {run.run_directory}")
+
     online = DuelingDQN(obs_dim=OBS_DIM, n_actions=N_ACTIONS)
     target = DuelingDQN(obs_dim=OBS_DIM, n_actions=N_ACTIONS)
     target.load_state_dict(online.state_dict())
@@ -149,8 +180,8 @@ def train(cfg: TrainConfig) -> DuelingDQN:
     loss_count = 0
     episode_return = 0.0
     episode_returns: list[float] = []
-    # Save-best signal: median terminal net worth from the greedy seeded eval, not the
-    # noisy last-20-training-episodes window (which was tracked but never acted on).
+    # Save-best uses median terminal net worth from greedy seeded validation,
+    # not the noisy recent-training-episode window.
     best_eval_score = float("-inf")
 
     pbar = tqdm(
@@ -205,8 +236,7 @@ def train(cfg: TrainConfig) -> DuelingDQN:
         if step % cfg.target_sync == 0:
             target.load_state_dict(online.state_dict())
 
-        # Periodic greedy seeded evaluation -> save-best. Done after warmup, when the
-        # policy is worth evaluating.
+        # Periodic greedy seeded validation drives save-best after warmup.
         if step >= cfg.warmup_steps and step % cfg.eval_every == 0:
             metrics = evaluate_net(
                 online,
@@ -216,9 +246,17 @@ def train(cfg: TrainConfig) -> DuelingDQN:
             )
             online.train()  # evaluate_net() puts the net in eval mode
             score = metrics["nw_median"]
-            if score > best_eval_score:
+            selected_as_best = score > best_eval_score
+            if selected_as_best:
                 best_eval_score = score
-                _save_checkpoint(online, cfg.best_path)
+                _save_checkpoint(online, str(run.best_checkpoint_path))
+            validation_metrics = _artifact_eval_metrics(metrics)
+            validation_metrics["selected_as_best"] = selected_as_best
+            run.append_metrics(
+                step=step,
+                split="validation",
+                metrics=validation_metrics,
+            )
             pbar.write(
                 f"step {step:>7} | EVAL median_nw {score:>12,.0f} "
                 f"({metrics['median_growth_x']:.2f}x) | "
@@ -247,18 +285,77 @@ def train(cfg: TrainConfig) -> DuelingDQN:
                 f"loss {avg_loss:8.5f} | avg_return {avg_ret:8.3f} | "
                 f"buffer {len(buffer):>6} | episodes {len(episode_returns):>5}"
             )
+            run.append_metrics(
+                step=step,
+                split="train",
+                metrics={
+                    "epsilon": eps,
+                    "loss_mean": avg_loss,
+                    "recent_episode_return_mean": (
+                        avg_ret if recent else None
+                    ),
+                    "replay_size": len(buffer),
+                    "episodes_completed": len(episode_returns),
+                    "best_validation_nw_median": (
+                        best_eval_score
+                        if best_eval_score != float("-inf")
+                        else None
+                    ),
+                },
+            )
             running_loss = 0.0
             loss_count = 0
 
     pbar.close()
-    # Always save the last checkpoint; best.pt holds the best eval seen during training.
-    _save_checkpoint(online, cfg.checkpoint_path)
+    # last.pt preserves the endpoint; best.pt preserves the selected policy.
+    _save_checkpoint(online, str(run.last_checkpoint_path))
     if best_eval_score == float("-inf"):
-        # Training never reached an eval (e.g. total_steps < warmup); best == last.
-        _save_checkpoint(online, cfg.best_path)
-    export_config(env.cfg, cfg.config_path)
-    print(f"saved last -> {cfg.checkpoint_path}, best -> {cfg.best_path}")
-    print(f"saved config sidecar -> {cfg.config_path}")
+        # No validation was reached, so the only candidate is also the best.
+        _save_checkpoint(online, str(run.best_checkpoint_path))
+
+    # This sidecar contains the derived constants needed by the eventual game
+    # client; config.json remains the full experiment snapshot.
+    sidecar_path = run.run_directory / "aurix_config.json"
+    export_config(env.cfg, str(sidecar_path))
+
+    best = DuelingDQN(obs_dim=OBS_DIM, n_actions=N_ACTIONS)
+    best.load_state_dict(
+        torch.load(
+            run.best_checkpoint_path,
+            map_location="cpu",
+            weights_only=True,
+        )
+    )
+    test_metrics = evaluate_net(
+        best,
+        n_episodes=cfg.test_episodes,
+        seed0=cfg.test_seed0,
+        config=env.cfg,
+    )
+    artifact_test_metrics = _artifact_eval_metrics(test_metrics)
+    run.append_metrics(
+        step=cfg.total_steps,
+        split="test",
+        metrics=artifact_test_metrics,
+    )
+    run.finish(
+        summary={
+            "best_validation_nw_median": (
+                best_eval_score
+                if best_eval_score != float("-inf")
+                else None
+            ),
+            "test": artifact_test_metrics,
+            "environment_sidecar": sidecar_path.name,
+        }
+    )
+    print(
+        "held-out test | "
+        f"median_nw {test_metrics['nw_median']:,.0f} "
+        f"({test_metrics['median_growth_x']:.2f}x) | "
+        f"bankruptcy {test_metrics['bankruptcy_rate']:.1%}"
+    )
+    print(f"completed run -> {run.run_directory}")
     return online
 
 

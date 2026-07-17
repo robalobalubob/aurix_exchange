@@ -122,6 +122,11 @@ $RECYCLE.BIN/
 .env.local
 *.local.json
 .claude/
+.agents/
+.codex/
+.github/
+# Root Markdown is ignored by default so local scratch notes do not appear as
+# project documentation. Explicitly allow the maintained entry points.
 *.md
 !docs/*.md
 !src/env/

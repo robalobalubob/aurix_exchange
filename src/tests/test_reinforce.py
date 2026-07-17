@@ -19,12 +19,28 @@ from src.models.policy import PolicyNet
 from src.training.train_reinforce import (
     advantages,
     collect_batch,
+    draw_training_reset_seed,
     greedy_policy,
+    held_out_seed_intervals,
     reinforce_loss,
     returns_to_go,
 )
 
 _CFG = OUCoreConfig(t_max=20)
+
+
+class _ScriptedRng:
+    """Small deterministic RNG stand-in for exercising rejection sampling."""
+
+    def __init__(self, values):
+        self._values = iter(values)
+        self.draw_count = 0
+
+    def integers(self, high):
+        value = next(self._values)
+        assert 0 <= value < high
+        self.draw_count += 1
+        return value
 
 
 def _hand_rolled_rtg(rewards: np.ndarray, gamma: float) -> np.ndarray:
@@ -68,10 +84,40 @@ def test_advantages_are_baselined_and_normalized():
 
 
 @pytest.mark.correctness
+def test_held_out_seed_intervals_are_half_open_and_disjoint():
+    assert held_out_seed_intervals(10_000, 500, 100_000, 5_000) == (
+        (10_000, 10_500),
+        (100_000, 105_000),
+    )
+    with pytest.raises(ValueError, match="must be disjoint"):
+        held_out_seed_intervals(100, 50, 125, 50)
+
+
+@pytest.mark.correctness
+def test_training_reset_seed_rejects_reserved_draws_and_resamples():
+    rng = _ScriptedRng([10_000, 104_999, 42])
+    reserved = held_out_seed_intervals(10_000, 500, 100_000, 5_000)
+
+    seed = draw_training_reset_seed(rng, reserved)
+
+    assert seed == 42
+    assert rng.draw_count == 3
+
+
+@pytest.mark.correctness
+def test_training_reset_seed_rejects_an_exhausted_seed_domain():
+    rng = _ScriptedRng([])
+    with pytest.raises(ValueError, match="leave no training seeds"):
+        draw_training_reset_seed(rng, ((0, 2**31 - 1),))
+
+
+@pytest.mark.correctness
 def test_collect_batch_matches_env_ledger():
-    """The batch collector must reproduce the env exactly: per-episode reward sums
-    are ln(W_T/W_0) under the canonical objective, and shapes/dtypes match the
-    float32 observation contract."""
+    """The batch collector must reproduce the environment ledger exactly.
+
+    Per-episode reward sums are ln(W_T/W_0) under the canonical objective,
+    and shapes and dtypes match the float32 observation contract.
+    """
     net = PolicyNet(obs_dim=_CFG.obs_dim, n_actions=_CFG.n_actions)
     envs = [OUTradingEnv(config=_CFG) for _ in range(3)]
     rng = np.random.default_rng(3)
@@ -86,7 +132,7 @@ def test_collect_batch_matches_env_ledger():
         obs[:, :, 2], np.arange(_CFG.t_max)[:, None] / _CFG.t_max * np.ones(3),
         atol=1e-6,
     )
-    # Replaying the recorded actions through a same-seeded env reproduces rewards.
+    # Replaying actions through a same-seeded env reproduces rewards.
     rng_replay = np.random.default_rng(3)
     seeds = [int(rng_replay.integers(2**31 - 1)) for _ in range(3)]
     for i, seed in enumerate(seeds):
@@ -125,7 +171,8 @@ def test_training_update_moves_parameters():
     assert np.isfinite(float(loss.item()))
     assert 0.0 < entropy <= np.log(_CFG.n_actions) + 1e-6
     assert any(
-        not torch.equal(b, p.detach()) for b, p in zip(before, net.parameters())
+        not torch.equal(before_param, param.detach())
+        for before_param, param in zip(before, net.parameters())
     )
 
 

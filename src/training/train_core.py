@@ -1,14 +1,14 @@
-"""Train the DQN/PER/dueling stack on the clean OU trading core (phase1_plan §6).
+"""Train the DQN/PER/dueling stack on the clean OU trading core.
 
-This is the learner-alignment run: same network and PER machinery as the game-env
-trainer, but on ``OUTradingEnv`` (obs ``[z, f, t/T]``, 3 actions) under the canonical
-objective — gamma=1, terminated-at-T (D2/D7), unclipped reward (D6), seeded PER (§1).
-Its output is the project's first regret number: the optimality gap of a learned agent
-against the DP ground truth, with common-random-numbers CI.
+This learner-alignment run uses the game trainer's network and PER machinery on
+``OUTradingEnv`` (obs ``[z, f, t/T]``, 3 actions). The canonical objective has
+gamma=1, termination at T, unclipped reward, and seeded PER. Its output is the
+learned agent's optimality gap against DP ground truth, with a common-random-
+numbers confidence interval.
 
-The save-best signal is regret itself (lowest regret = best), measured by a periodic
-greedy seeded evaluation through the regret harness — the metric we actually care
-about, not a proxy. The DP optimum is solved once and cached on disk by config hash.
+The save-best signal is regret itself (lowest is best), measured by periodic
+greedy seeded validation. The DP optimum is solved once and cached by config
+hash.
 
 Usage:
     python -m src.training.train_core
@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import argparse
 import os
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from typing import Optional
 
 import numpy as np
@@ -29,6 +29,7 @@ from tqdm import tqdm
 from src.env.ou_core import OUCoreConfig, OUTradingEnv
 from src.models.dqn import DuelingDQN
 from src.solvers import dp, regret
+from src.training.artifacts import create_run, file_sha256
 from src.training.replay_buffer import PrioritizedReplayBuffer
 from src.training.train_dqn import _linear_anneal, compute_loss, select_action
 
@@ -44,8 +45,8 @@ class TrainCoreConfig:
     train_every: int = 1
     target_sync: int = 1_000
 
-    # Optimisation. learner_gamma defaults to the env's discount (gamma=1 canonical);
-    # the gamma=0.99-no-time ablation sets this to 0.99 with core.time_feature=False.
+    # learner_gamma defaults to the canonical env discount. The gamma=0.99
+    # ablation sets this and disables core.time_feature.
     batch_size: int = 64
     lr: float = 5.0e-4
     learner_gamma: Optional[float] = None  # None -> use core.gamma
@@ -62,25 +63,35 @@ class TrainCoreConfig:
     eps_end: float = 0.05
     eps_decay_steps: int = 50_000
 
-    # Periodic greedy seeded eval (regret-based save-best) + final report.
+    # Periodic validation selects the checkpoint; final evaluation uses a
+    # disjoint seed block and therefore remains held out.
     eval_every: int = 10_000
     eval_episodes: int = 1_000
     final_eval_episodes: int = 5_000
     eval_seed0: int = 10_000
+    test_seed0: int = 100_000
 
     # Bookkeeping
     log_every: int = 2_000
-    checkpoint_path: str = "exports/core_last.pt"
-    best_path: str = "exports/core_best.pt"
+    artifact_root: str = "exports/runs"
+    run_id: Optional[str] = None
     dp_cache_dir: str = "exports"
     seed: Optional[int] = 0
 
     @property
     def gamma(self) -> float:
-        return self.core.gamma if self.learner_gamma is None else self.learner_gamma
+        return (
+            self.core.gamma
+            if self.learner_gamma is None
+            else self.learner_gamma
+        )
 
 
-def solve_or_load(core: OUCoreConfig, grid: dp.DPGrid, cache_dir: str) -> dp.DPResult:
+def solve_or_load(
+    core: OUCoreConfig,
+    grid: dp.DPGrid,
+    cache_dir: str,
+) -> dp.DPResult:
     """Solve the DP optimum, caching it on disk by (config, grid) hash."""
     h = dp.config_hash(core, grid)
     path = os.path.join(cache_dir, f"dp_{h}.npz")
@@ -93,7 +104,7 @@ def solve_or_load(core: OUCoreConfig, grid: dp.DPGrid, cache_dir: str) -> dp.DPR
 
 
 def net_policy(net: DuelingDQN) -> regret.Policy:
-    """Greedy policy closure over a network (clean core needs no action mask)."""
+    """Wrap a network as a greedy clean-core policy."""
     net.eval()
 
     def policy(obs: np.ndarray, t: int) -> int:
@@ -117,10 +128,27 @@ def train(cfg: TrainCoreConfig) -> tuple[DuelingDQN, regret.RegretReport]:
     rng = np.random.default_rng(act_seed)
     torch.manual_seed(cfg.seed if cfg.seed is not None else 0)
 
-    # Ground truth + precomputed pi* returns on the eval seed block (paired regret).
+    # Ground truth plus pi* returns on validation seeds for paired regret.
     res = solve_or_load(core, dp.DPGrid(), cfg.dp_cache_dir)
+    run = create_run(
+        "dqn_core",
+        seed=cfg.seed,
+        training_config=cfg,
+        environment_config=core,
+        root=cfg.artifact_root,
+        run_id=cfg.run_id,
+        metadata={
+            "dp_config_hash": res.config_hash,
+            "environment": "OUTradingEnv",
+            "selection_metric": "validation.regret",
+        },
+    )
+    print(f"run artifacts -> {run.run_directory}")
+
     eval_seeds = regret.make_seed_block(cfg.eval_episodes, cfg.eval_seed0)
-    pistar_eval_returns, _ = regret.rollout(regret.from_dp(res), core, eval_seeds)
+    pistar_eval_returns, _ = regret.rollout(
+        regret.from_dp(res), core, eval_seeds
+    )
 
     env = OUTradingEnv(config=core, seed=cfg.seed)
     online = DuelingDQN(obs_dim=obs_dim, n_actions=n_actions)
@@ -138,16 +166,21 @@ def train(cfg: TrainCoreConfig) -> tuple[DuelingDQN, regret.RegretReport]:
     mask = info["action_mask"]
     running_loss, loss_count = 0.0, 0
     best_regret = float("inf")
+    best_validation_step: int | None = None
 
     pbar = tqdm(range(1, cfg.total_steps + 1), desc="train_core", unit="step",
                 dynamic_ncols=True, smoothing=0.05)
     for step in pbar:
-        eps = _linear_anneal(cfg.eps_start, cfg.eps_end, step / cfg.eps_decay_steps)
+        eps = _linear_anneal(
+            cfg.eps_start,
+            cfg.eps_end,
+            step / cfg.eps_decay_steps,
+        )
         action = select_action(online, obs, mask, eps, rng)
 
         next_obs, reward_t, terminated, truncated, info = env.step(action)
         next_mask = info["action_mask"]
-        # Only `terminated` zeroes the bootstrap; the core terminates at T (D2).
+        # Only `terminated` zeroes bootstrap; the core terminates at T.
         buffer.add(obs, action, reward_t, next_obs, terminated, next_mask)
         obs, mask = next_obs, next_mask
 
@@ -177,41 +210,137 @@ def train(cfg: TrainCoreConfig) -> tuple[DuelingDQN, regret.RegretReport]:
                 seed0=cfg.eval_seed0, pistar_returns=pistar_eval_returns,
             )
             online.train()
-            if rep.regret < best_regret:
+            selected_as_best = rep.regret < best_regret
+            validation_checkpoint = None
+            if selected_as_best:
                 best_regret = rep.regret
-                _save(online, cfg.best_path)
+                best_validation_step = step
+                _save(online, str(run.best_checkpoint_path))
+                validation_checkpoint = {
+                    "path": run.best_checkpoint_path.name,
+                    "sha256": file_sha256(run.best_checkpoint_path),
+                    "selected_validation_step": step,
+                }
+            validation_metrics = asdict(rep)
+            validation_metrics["selected_as_best"] = selected_as_best
+            run.append_metrics(
+                step=step,
+                split="validation",
+                metrics=validation_metrics,
+                metadata=(
+                    {"selected_checkpoint": validation_checkpoint}
+                    if validation_checkpoint is not None
+                    else None
+                ),
+            )
             pbar.write(
                 f"step {step:>7} | EVAL regret {rep.regret:7.4f} "
                 f"(paired {rep.paired_regret:7.4f} +/- {rep.paired_ci:.4f}) | "
-                f"agree {rep.agreement_rate:.1%} | best_regret {best_regret:7.4f}"
+                f"agree {rep.agreement_rate:.1%} | "
+                f"best_regret {best_regret:7.4f}"
             )
 
         if step % cfg.log_every == 0:
             avg_loss = running_loss / max(loss_count, 1)
             pbar.set_postfix(eps=f"{eps:.3f}", loss=f"{avg_loss:.4f}",
                              best_regret=f"{best_regret:.3f}", refresh=False)
+            run.append_metrics(
+                step=step,
+                split="train",
+                metrics={
+                    "epsilon": eps,
+                    "loss_mean": avg_loss,
+                    "replay_size": len(buffer),
+                    "best_validation_regret": (
+                        best_regret
+                        if best_regret != float("inf")
+                        else None
+                    ),
+                },
+            )
             running_loss, loss_count = 0.0, 0
 
     pbar.close()
-    _save(online, cfg.checkpoint_path)
+    _save(online, str(run.last_checkpoint_path))
     if best_regret == float("inf"):
-        _save(online, cfg.best_path)
+        rep = regret.evaluate_regret(
+            net_policy(online),
+            res,
+            n_episodes=cfg.eval_episodes,
+            seed0=cfg.eval_seed0,
+            pistar_returns=pistar_eval_returns,
+        )
+        online.train()
+        best_regret = rep.regret
+        best_validation_step = cfg.total_steps
+        _save(online, str(run.best_checkpoint_path))
+        validation_metrics = asdict(rep)
+        validation_metrics["selected_as_best"] = True
+        run.append_metrics(
+            step=cfg.total_steps,
+            split="validation",
+            metrics=validation_metrics,
+            metadata={
+                "selected_checkpoint": {
+                    "path": run.best_checkpoint_path.name,
+                    "sha256": file_sha256(run.best_checkpoint_path),
+                    "selected_validation_step": cfg.total_steps,
+                }
+            },
+        )
 
-    # First regret number: evaluate the best checkpoint at full resolution.
+    assert best_validation_step is not None
+    selected_checkpoint = {
+        "path": run.best_checkpoint_path.name,
+        "sha256": file_sha256(run.best_checkpoint_path),
+        "selected_validation_step": best_validation_step,
+    }
+
+    # Evaluate the selected checkpoint once on a disjoint held-out seed block.
     best = DuelingDQN(obs_dim=obs_dim, n_actions=n_actions)
-    best.load_state_dict(torch.load(cfg.best_path))
+    best.load_state_dict(
+        torch.load(
+            run.best_checkpoint_path,
+            map_location="cpu",
+            weights_only=True,
+        )
+    )
     final = regret.evaluate_regret(
-        net_policy(best), res, n_episodes=cfg.final_eval_episodes, seed0=cfg.eval_seed0,
+        net_policy(best),
+        res,
+        n_episodes=cfg.final_eval_episodes,
+        seed0=cfg.test_seed0,
+    )
+    run.append_metrics(
+        step=cfg.total_steps,
+        split="test",
+        metrics=asdict(final),
+        metadata={"selected_checkpoint": selected_checkpoint},
+    )
+    run.finish(
+        summary={
+            "best_validation_regret": (
+                best_regret if best_regret != float("inf") else None
+            ),
+            "test": asdict(final),
+            "dp_config_hash": res.config_hash,
+            "selected_checkpoint": selected_checkpoint,
+        }
     )
     print("\n=== DQN on clean core - first regret number ===")
     print(f"config hash {res.config_hash}")
     print(final.render())
+    print(f"completed run -> {run.run_directory}")
     return best, final
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train DQN on the clean OU core.")
-    parser.add_argument("--steps", type=int, default=TrainCoreConfig.total_steps)
+    parser = argparse.ArgumentParser(
+        description="Train DQN on the clean OU core."
+    )
+    parser.add_argument(
+        "--steps", type=int, default=TrainCoreConfig.total_steps
+    )
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
     train(replace(TrainCoreConfig(), total_steps=args.steps, seed=args.seed))
