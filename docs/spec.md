@@ -53,13 +53,28 @@ $I_{\text{market},t}^i$ is the running volume of commodity units held in the pub
 
 * $\omega_i$ is the price elasticity coefficient of asset $i$.
 
-### 2.3 Market Friction & Slidings
+### 2.3 Market Friction & Slippage
 
-* **Temporary Impact (Execution Friction):**
+M2 uses commodity capacity as market depth so raw unit scales do not produce
+different or non-positive liquidation behavior. For capacity $K_i$, order size $q$,
+normalized depth $x=q/K_i$, and dimensionless log-impact $\kappa$, marginal prices are
 
-$$P_{\text{exec}}^i = S_t^i \cdot (1 + \eta_t q_t^i) \cdot (1 \pm \varphi)$$
+$$p_{\text{buy}}(u)=S_t^i e^{\kappa u}, \qquad
+p_{\text{sell}}(u)=S_t^i e^{-\kappa u}, \qquad 0\le u\le x.$$
 
-(where $q_t^i > 0$ represents a buy , and $\varphi$ is the baseline 5% global market transaction tax levied at Belos ).
+The complete block-order ledgers integrate those curves:
+
+$$\operatorname{BuyCost}(q)=(1+\varphi)S_t^iK_i
+\frac{e^{\kappa x}-1}{\kappa},$$
+
+$$\operatorname{SellCash}(q)=(1-\varphi)S_t^iK_i
+\frac{1-e^{-\kappa x}}{\kappa}.$$
+
+Their $\kappa=0$ limits are $S_t^iq(1+\varphi)$ and
+$S_t^iq(1-\varphi)$. The stationary M2 defaults are $\kappa=0.10$ at a
+full warehouse and brokerage $\varphi=0.01$. BUY spends exactly 25% of cash and is
+masked unless the complete quoted fill fits; SELL liquidates the complete selected
+inventory. See `m2_plan.md` for the evidence boundary and acceptance tests.
 
 ### 2.4 Fatigue & Localized Expedition Hazards
 
@@ -241,18 +256,22 @@ The C# client reads this sidecar at initialization to dynamically rebuild normal
 
 ```json
 {
+  "schema_version": 2,
+  "environment_contract": "m2_stationary_v1",
   "obs_dim": 10,
   "n_actions": 8,
   "config": {
-    "global_market_tax_rate": 0.05,
-    "max_capacity_byrinium": 500,
-    "max_capacity_herbs": 2500,
-    "max_capacity_tools": 100,
-    "expedition_launch_cost": 150.0
+    "brokerage_fee": 0.01,
+    "impact_log_at_capacity": 0.10,
+    "min_trade_notional": 1.0,
+    "max_inventory": [500.0, 2500.0, 100.0],
+    "launch_fee_base": 800.0,
+    "launch_fee_fatigue_k": 1.0,
+    "expedition_min_cash": 1600.0
   },
   "derived": {
-    "sigma_stat": [0.40, 0.15, 0.25],
-    "gou_mu": [5.01, 3.40, 6.40]
+    "sigma_stat": [0.894427, 0.15, 0.790569],
+    "gou_decay": [0.904837, 0.606531, 0.951229]
   }
 }
 

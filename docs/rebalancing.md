@@ -113,32 +113,33 @@ $$o_t = [C_t, I_t^B, I_t^H, I_t^T, X_t^B, X_t^H, X_t^T, F_t, \tau_t, T_{\text{co
 
 ### 3.2 Action Masking Matrix Architecture
 
-Valid action paths must be asserted via an active boolean layer before computing value-network layers to suppress illegal actions across phases and cooldown locks:
+Valid action paths must be asserted via an active boolean layer before value selection.
+As of the M2 stationary contract, legality includes economic executability, not only
+phase and cooldown rules:
 
 ```python
-def get_action_mask(state):
-    # state mapping: [Cash, InvB, InvH, InvT, PriceB, PriceH, PriceT, Fatigue, Phase, Cooldown]
+def get_action_mask(internal_state, config):
     mask = np.ones(8, dtype=bool)
-    phase = int(state[8] * 3.0)
-    cooldown = int(state[9] * 2.0)
-    cash = state[0]
-    
-    # Rule 1: Cooldown Lockout
-    if cooldown > 0:
-        mask[7] = False  # Block LAUNCH_EXPEDITION
-        
-    # Rule 2: Phase-Based Structural Bans
-    if phase == 3:  # Night Phase Curfew
-        mask[1] = mask[3] = mask[5] = False  # Block standard open market purchases
-        mask[7] = False                      # Block legal daytime expeditions
-        
-    # Rule 3: Liquidity Checks
-    if cash <= MIN_LAUNCH_COST:
-        mask[7] = False  # Cannot afford sourcing overhead
-        
-    return mask
 
+    for buy_action, commodity in BUY_ACTIONS.items():
+        # quote_buy returns None if 25% of cash is below the minimum notional or
+        # if the entire capacity-normalized fill cannot fit.
+        mask[buy_action] = quote_buy(internal_state, commodity, config) is not None
+
+    for sell_action, commodity in SELL_ACTIONS.items():
+        # Dust inventory below the minimum notional is not a valid action.
+        mask[sell_action] = quote_sell(internal_state, commodity, config) is not None
+
+    mask[LAUNCH_EXPEDITION] &= expedition_is_eligible(internal_state, config)
+    if internal_state.phase == NIGHT:
+        mask[BUY_ACTION_INDICES] = False
+        mask[LAUNCH_EXPEDITION] = False
+    return mask
 ```
+
+The executable quote functions in `src/env/aurix_env.py` are authoritative. They use
+the integrated log-depth equations in `spec.md` and are shared by masking and
+execution so the two paths cannot disagree.
 
 ---
 
@@ -155,6 +156,13 @@ To ensure the environment design is completely validated before exporting the ne
 
 ---
 
-### Next Step for Implementation Optimization
+### Active M2 follow-up
 
-To initialize the Week 1 environment configuration files based on this structural shift, should the **upfront expedition launch fee ($C_{\text{launch}}$)** be mapped as a fixed flat rate, or should it scale dynamically based on your current **Party Fatigue ($F_t$)** metric to simulate the increasing logistical overhead of managing an exhausted mercenary crew?
+The launch fee is now fatigue-scaled and localized failure/cooldown behavior is
+implemented. The M2 defaults are an 800-unit base fee and a 1600-unit liquidity
+guard. At equilibrium prices, a rested launch has mildly positive expected net value
+(about +83), while a launch at pre-trip fatigue 25 is negative (about -208). This
+makes rest and fatigue strategically relevant without deleting the expedition option.
+The 500-path development diagnostic is complete; the remaining Phase A task is to
+validate and freeze that contract, then predeclare and train the game-facing DQN. See
+`m2_plan.md`.

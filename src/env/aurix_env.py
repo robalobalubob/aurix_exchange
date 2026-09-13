@@ -43,6 +43,7 @@ _BUY_ACTIONS: tuple[int, ...] = (BUY_BYRINIUM, BUY_HERBS, BUY_TOOLS)
 @dataclass(frozen=True)
 class EnvConfig:
     # Episode
+    stationary_contract_version: str = "m2_stationary_v1"
     t_max: int = 200
     initial_cash: float = 10_000.0
 
@@ -62,10 +63,11 @@ class EnvConfig:
     # ln(max_expected_cash) — matches C# divisor of 11.5
     cash_norm: float = 11.5
 
-    # Market impact. Permanent impact (μ ← μ + y·q) removed per rebalancing.md §2.1
-    # to close the self-inflation exploit; μ is now static at baseline.
+    # Market friction. Permanent impact (μ ← μ + y·q) is absent. Temporary
+    # impact is dimensionless log-price movement at one full warehouse of depth;
+    # execution integrates the depth curve rather than multiplying by raw units.
     brokerage_fee: float = 0.01
-    temp_impact: float = 0.002
+    impact_log_at_capacity: float = 0.10
 
     # Expedition
     expedition_fatigue_gain: float = 15.0
@@ -73,10 +75,10 @@ class EnvConfig:
     fatigue_max: float = 100.0
     expedition_fatigue_ceiling: float = 95.0
     expedition_harvest: float = 10.0
-    expedition_min_cash: float = 200.0
+    expedition_min_cash: float = 1_600.0
     # Upfront launch fee, paid on every launch regardless of outcome (rebalancing.md
     # §2.3). Scales with party fatigue: fee = base · (1 + k · F / fatigue_max).
-    launch_fee_base: float = 100.0
+    launch_fee_base: float = 800.0
     launch_fee_fatigue_k: float = 1.0
     # Localized-failure cooldown: steps during which LAUNCH_EXPEDITION is masked.
     expedition_cooldown_steps: int = 2
@@ -101,9 +103,44 @@ class EnvConfig:
     fatigue_f_crit: float = 75.0
     hold_penalty: float = 0.001
 
-    # Action-mask thresholds (must be mirrored by the C# client — see sidecar)
-    buy_cash_epsilon: float = 1e-6
-    sell_inventory_epsilon: float = 1e-9
+    # Action-mask thresholds (must be mirrored by the C# client — see sidecar).
+    # A valid trade must move at least one unit of currency, while the quantity
+    # epsilon is reserved for floating-point inventory/capacity comparisons.
+    min_trade_notional: float = 1.0
+    trade_quantity_epsilon: float = 1e-9
+
+    def __post_init__(self) -> None:
+        """Reject trade parameters that break the M2 economic invariants."""
+        if not 0.0 < self.buy_fraction <= 1.0:
+            raise ValueError("buy_fraction must be in (0, 1]")
+        if not 0.0 <= self.brokerage_fee < 1.0:
+            raise ValueError("brokerage_fee must be in [0, 1)")
+        if not 0.0 <= self.impact_log_at_capacity <= 1.0:
+            raise ValueError("impact_log_at_capacity must be in [0, 1]")
+        if self.min_trade_notional <= 0.0:
+            raise ValueError("min_trade_notional must be positive")
+        if self.trade_quantity_epsilon <= 0.0:
+            raise ValueError("trade_quantity_epsilon must be positive")
+        if any(capacity <= 0.0 for capacity in self.max_inventory):
+            raise ValueError("all max_inventory values must be positive")
+        if self.launch_fee_base <= 0.0:
+            raise ValueError("launch_fee_base must be positive")
+        if self.launch_fee_fatigue_k < 0.0:
+            raise ValueError("launch_fee_fatigue_k must be non-negative")
+        if not 0.0 < self.expedition_fatigue_ceiling <= self.fatigue_max:
+            raise ValueError(
+                "expedition_fatigue_ceiling must be in (0, fatigue_max]"
+            )
+        largest_eligible_fee = self.launch_fee_base * (
+            1.0
+            + self.launch_fee_fatigue_k
+            * self.expedition_fatigue_ceiling
+            / self.fatigue_max
+        )
+        if self.expedition_min_cash < largest_eligible_fee:
+            raise ValueError(
+                "expedition_min_cash must cover the largest eligible launch fee"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -258,14 +295,16 @@ class AurixExchangeEnv(gym.Env):
     def _action_mask(self) -> np.ndarray:
         mask = np.ones(N_ACTIONS, dtype=bool)
 
-        # BUY: need enough cash to execute a meaningful trade
-        if self._cash < self.cfg.buy_cash_epsilon:
-            for action in _BUY_ACTIONS:
+        # A BUY is valid only if the full 25%-cash quote is meaningful and fits
+        # in that commodity's remaining capacity. This prevents zero-fill actions
+        # and preserves the action contract instead of silently making a partial buy.
+        for action, idx in _BUY_TO_IDX.items():
+            if self._quote_buy(idx) is None:
                 mask[action] = False
 
-        # SELL: need non-zero inventory
+        # A SELL must liquidate economically meaningful inventory.
         for action, idx in _SELL_TO_IDX.items():
-            if self._inventory[idx] < self.cfg.sell_inventory_epsilon:
+            if self._quote_sell(idx) is None:
                 mask[action] = False
 
         # LAUNCH_EXPEDITION: cooldown lockout, fatigue ceiling, or insufficient
@@ -274,6 +313,7 @@ class AurixExchangeEnv(gym.Env):
             self._cooldown > 0
             or self._fatigue >= self.cfg.expedition_fatigue_ceiling
             or self._cash < self.cfg.expedition_min_cash
+            or self._cash < self._launch_fee()
         ):
             mask[LAUNCH_EXPEDITION] = False
 
@@ -289,27 +329,93 @@ class AurixExchangeEnv(gym.Env):
     # Trade execution
     # ------------------------------------------------------------------
 
-    def _execute_buy(self, idx: int) -> None:
-        spend = self.cfg.buy_fraction * self._cash
-        S = math.exp(self._log_prices[idx])
-        # Approximate qty ignoring impact, then refine exec price
-        qty_approx = spend / (S * (1.0 + self.cfg.brokerage_fee))
-        exec_price = S * (1.0 + self.cfg.temp_impact * qty_approx) * (1.0 + self.cfg.brokerage_fee)
-        qty = spend / exec_price
-        # Clamp to remaining per-commodity capacity
-        qty = min(qty, self._max_inventory[idx] - self._inventory[idx])
-        actual_cost = qty * exec_price
+    def _quote_buy(self, idx: int) -> Optional[tuple[float, float]]:
+        """Return ``(quantity, cost)`` for an exact 25%-cash BUY, or ``None``.
 
-        self._cash -= actual_cost
-        self._inventory[idx] += qty
+        Market depth is the commodity's carrying capacity ``K``. With normalized
+        order fraction ``x = q / K`` and log-impact coefficient ``kappa``, the
+        marginal buy price is ``S * exp(kappa * x)``. Integrating that curve and
+        inverting its cost yields the exact affordable quantity below.
+        """
+        cfg = self.cfg
+        budget = cfg.buy_fraction * self._cash
+        if budget < cfg.min_trade_notional:
+            return None
+
+        capacity = self._max_inventory[idx]
+        remaining = capacity - self._inventory[idx]
+        if remaining <= cfg.trade_quantity_epsilon:
+            return None
+
+        spot = math.exp(self._log_prices[idx])
+        fee_adjusted_spot = spot * (1.0 + cfg.brokerage_fee)
+        kappa = cfg.impact_log_at_capacity
+        if kappa == 0.0:
+            quantity = budget / fee_adjusted_spot
+        else:
+            scaled_budget = kappa * budget / (fee_adjusted_spot * capacity)
+            quantity = capacity * math.log1p(scaled_budget) / kappa
+
+        if quantity <= cfg.trade_quantity_epsilon:
+            return None
+        if quantity > remaining:
+            if quantity - remaining > cfg.trade_quantity_epsilon:
+                return None
+            # Treat sub-epsilon disagreement as floating-point boundary noise.
+            # Spending remains exactly 25% of cash and the executor lands on the
+            # capacity boundary rather than exceeding it by a few ulps.
+            quantity = remaining
+        return quantity, budget
+
+    def _quote_sell(self, idx: int) -> Optional[tuple[float, float]]:
+        """Return ``(quantity, proceeds)`` for a full-inventory SELL, or ``None``.
+
+        The marginal sell price is ``S * exp(-kappa * x)``. Its integral is
+        positive and strictly increasing for every legal quantity, so a larger
+        liquidation can never pay less or collapse onto an arbitrary price floor.
+        """
+        cfg = self.cfg
+        quantity = float(self._inventory[idx])
+        if quantity <= cfg.trade_quantity_epsilon:
+            return None
+
+        capacity = self._max_inventory[idx]
+        if quantity > capacity + cfg.trade_quantity_epsilon:
+            raise RuntimeError("inventory exceeds configured carrying capacity")
+        quantity = min(quantity, capacity)
+
+        spot = math.exp(self._log_prices[idx])
+        if spot * quantity < cfg.min_trade_notional:
+            return None
+
+        kappa = cfg.impact_log_at_capacity
+        if kappa == 0.0:
+            depth_adjusted_quantity = quantity
+        else:
+            fraction = quantity / capacity
+            depth_adjusted_quantity = (
+                capacity * -math.expm1(-kappa * fraction) / kappa
+            )
+        proceeds = (
+            spot * (1.0 - cfg.brokerage_fee) * depth_adjusted_quantity
+        )
+        if not math.isfinite(proceeds) or proceeds <= 0.0:
+            raise RuntimeError("sell quote must produce finite positive proceeds")
+        return quantity, proceeds
+
+    def _execute_buy(self, idx: int) -> None:
+        quote = self._quote_buy(idx)
+        if quote is None:
+            raise ValueError("BUY is not executable in the current state")
+        quantity, cost = quote
+        self._cash -= cost
+        self._inventory[idx] += quantity
 
     def _execute_sell(self, idx: int) -> None:
-        qty = self._inventory[idx]
-        S = math.exp(self._log_prices[idx])
-        exec_price = S * (1.0 - self.cfg.temp_impact * qty) * (1.0 - self.cfg.brokerage_fee)
-        exec_price = max(exec_price, 1e-8)
-        proceeds = qty * exec_price
-
+        quote = self._quote_sell(idx)
+        if quote is None:
+            raise ValueError("SELL is not executable in the current state")
+        _, proceeds = quote
         self._cash += proceeds
         self._inventory[idx] = 0.0
 
@@ -327,8 +433,12 @@ class AurixExchangeEnv(gym.Env):
         """Run a sourcing expedition. Returns True on localized (non-catastrophic)
         failure, which arms the cooldown but never forfeits cash or node inventory.
         """
-        # Upfront fee is paid regardless of outcome.
-        self._cash = max(0.0, self._cash - self._launch_fee())
+        # Upfront fee is paid exactly regardless of outcome. The shared mask and
+        # configuration invariant guarantee affordability; never silently clamp it.
+        fee = self._launch_fee()
+        if self._cash < fee:
+            raise ValueError("expedition fee is not affordable in the current state")
+        self._cash -= fee
         # The trip is taken either way, so fatigue accrues either way.
         self._fatigue = min(
             self.cfg.fatigue_max, self._fatigue + self.cfg.expedition_fatigue_gain
@@ -451,6 +561,8 @@ def export_config(cfg: EnvConfig, path: str) -> None:
     gou_noise_std = sigmas * np.sqrt((1.0 - np.exp(-2.0 * thetas)) / (2.0 * thetas))
 
     payload = {
+        "schema_version": 2,
+        "environment_contract": cfg.stationary_contract_version,
         "obs_dim": OBS_DIM,
         "n_actions": N_ACTIONS,
         "config": asdict(cfg),

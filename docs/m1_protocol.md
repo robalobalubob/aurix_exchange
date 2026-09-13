@@ -1,8 +1,8 @@
 # M1 protocol: replication across training seeds
 
-**Status:** orchestration and aggregation infrastructure is implemented and verified;
-the empirical milestone is not complete until all 20 predeclared runs have finished
-and their held-out results have been summarized.
+**Status:** M1 infrastructure and empirical evidence are complete (2026-07-17).
+All 20 predeclared runs finished under the locked protocol; the durable outcome is
+recorded in [`m1_results.md`](m1_results.md).
 
 M0 made a single training run reproducible. M1 asks the next scientific question:
 does the conclusion survive retraining?
@@ -250,14 +250,14 @@ Infrastructure:
 
 Empirical evidence:
 
-- [ ] All 20 intended full-budget runs are complete or any failures are explicitly
+- [x] All 20 intended full-budget runs are complete or any failures are explicitly
   accounted for.
-- [ ] The report contains raw per-seed held-out regrets and the four required summary
+- [x] The report contains raw per-seed held-out regrets and the four required summary
   statistics for every algorithm.
-- [ ] Training collapses remain in the evidence.
-- [ ] Conclusions distinguish rollout uncertainty from training-seed variation.
-- [ ] No significance or general algorithm-ranking claim is made from `n = 5`.
+- [x] No valid training collapse occurred, and no run was removed from the evidence.
+- [x] Conclusions distinguish rollout uncertainty from training-seed variation.
+- [x] No significance or general algorithm-ranking claim is made from `n = 5`.
 
-Completing the runner and summary tooling completes the **M1 infrastructure**. Filling
-the checklist with 20 full default-budget runs completes the **M1 empirical evidence**.
-Those are deliberately separate claims.
+The runner and summary tooling completed the **M1 infrastructure**. The clean 20-run
+study filled this checklist and completed the separate **M1 empirical evidence**
+milestone. See [`m1_results.md`](m1_results.md) for the frozen result.

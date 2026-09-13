@@ -1,16 +1,14 @@
 # Phase 2 Results — The Algorithm Ladder
 
-**Status:** Policy-gradient rungs complete (REINFORCE, A2C, PPO — 2026-07-11).
-Remaining Phase 2 menu: continuous control (SAC/DDPG), model-based (MCTS, Dyna)
-with sample-efficiency curves.
+**Status:** Historical seed-0 ladder (2026-07-11). The replicated M1 evidence is
+complete and supersedes this document for reliability and cross-algorithm conclusions;
+see [`m1_results.md`](m1_results.md).
 
-> **M1 protocol note (2026-07-16):** These are historical, exploratory
-> single-training-seed results. Their final reports reused the `10_000+`
-> validation path block, and their rollout confidence intervals do not measure
-> retraining variability. Claims below about algorithm families or overlapping
-> intervals are therefore provisional. The locked M1 study retrains seeds 0–4,
-> selects checkpoints on `10_000+`, and reports once on held-out `100_000+`
-> paths; see `docs/m1_protocol.md`.
+> **M1 closeout note (2026-07-17):** These tables remain the exploratory
+> single-training-seed record. Their rollout confidence intervals measured random
+> market-path uncertainty for one trained policy, not sensitivity to retraining, and
+> therefore never established algorithm equivalence. M1 retrained seeds 0-4, selected
+> on the validation block, and evaluated once on a separate held-out block.
 
 Every rung runs on the *identical* clean core (canonical single-asset Byrinium
 instance, config hash `c7e2adda5358b757`, E_z[V\*_0] = **6.6385**) and is scored by

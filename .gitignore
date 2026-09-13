@@ -128,5 +128,6 @@ $RECYCLE.BIN/
 # Root Markdown is ignored by default so local scratch notes do not appear as
 # project documentation. Explicitly allow the maintained entry points.
 *.md
+!README.md
 !docs/*.md
 !src/env/

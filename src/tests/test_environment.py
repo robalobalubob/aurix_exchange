@@ -68,6 +68,28 @@ def cfg() -> EnvConfig:
     return EnvConfig()
 
 
+@pytest.mark.correctness
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"buy_fraction": 0.0},
+        {"brokerage_fee": 1.0},
+        {"impact_log_at_capacity": -0.1},
+        {"impact_log_at_capacity": 1.1},
+        {"min_trade_notional": 0.0},
+        {"trade_quantity_epsilon": 0.0},
+        {"max_inventory": (500.0, 0.0, 100.0)},
+        {"launch_fee_base": 0.0},
+        {"launch_fee_fatigue_k": -0.1},
+        {"expedition_min_cash": 100.0},
+    ],
+)
+def test_invalid_economic_contract_is_rejected(override: dict) -> None:
+    """Invalid parameters must fail before they can create broken transitions."""
+    with pytest.raises(ValueError):
+        EnvConfig(**override)
+
+
 # ===========================================================================
 # 1. Gymnasium API Contract
 # ===========================================================================
@@ -375,11 +397,92 @@ def test_buy_masked_when_cash_empty(env: AurixExchangeEnv) -> None:
 
 
 @pytest.mark.correctness
+@pytest.mark.parametrize(
+    ("idx", "buy_action"),
+    [
+        (IDX_B, BUY_BYRINIUM),
+        (IDX_H, BUY_HERBS),
+        (IDX_T, BUY_TOOLS),
+    ],
+)
+def test_buy_masked_when_commodity_capacity_is_full(
+    env: AurixExchangeEnv, idx: int, buy_action: int
+) -> None:
+    """A full warehouse must not expose a zero-fill BUY as a valid action."""
+    env.reset()
+    env._cash = 10_000.0
+    env._step_count = 0
+    env._inventory[idx] = env._max_inventory[idx]
+    assert env._action_mask()[buy_action] == False  # noqa: E712
+
+
+@pytest.mark.correctness
+def test_buy_capacity_mask_is_commodity_specific(env: AurixExchangeEnv) -> None:
+    """Filling one warehouse must not disable purchases of other commodities."""
+    env.reset()
+    env._cash = 10_000.0
+    env._step_count = 0
+    env._inventory[IDX_B] = env._max_inventory[IDX_B]
+    mask = env._action_mask()
+    assert mask[BUY_BYRINIUM] == False  # noqa: E712
+    assert mask[BUY_HERBS] == True  # noqa: E712
+    assert mask[BUY_TOOLS] == True  # noqa: E712
+
+
+@pytest.mark.correctness
+def test_buy_masked_when_complete_budgeted_fill_will_not_fit(
+    env: AurixExchangeEnv,
+) -> None:
+    """BUY means exactly 25% of cash; it must not silently become a partial fill."""
+    env.reset()
+    env._cash = 10_000.0
+    env._step_count = 0
+    quote = env._quote_buy(IDX_B)
+    assert quote is not None
+    quoted_qty, _ = quote
+    env._inventory[IDX_B] = env._max_inventory[IDX_B] - 0.5 * quoted_qty
+    assert env._action_mask()[BUY_BYRINIUM] == False  # noqa: E712
+
+
+@pytest.mark.correctness
+def test_buy_capacity_boundary_matches_complete_quote(
+    env: AurixExchangeEnv,
+) -> None:
+    """Capacity immediately below/at/above the quoted fill has a fixed contract."""
+    env.reset()
+    env._cash = 10_000.0
+    env._step_count = 0
+    quote = env._quote_buy(IDX_B)
+    assert quote is not None
+    quoted_qty, _ = quote
+    capacity = env._max_inventory[IDX_B]
+    epsilon = env.cfg.trade_quantity_epsilon
+
+    env._inventory[IDX_B] = capacity - quoted_qty - 10.0 * epsilon
+    assert env._quote_buy(IDX_B) is not None
+
+    env._inventory[IDX_B] = capacity - quoted_qty
+    assert env._quote_buy(IDX_B) is not None
+
+    env._inventory[IDX_B] = capacity - quoted_qty + 10.0 * epsilon
+    assert env._quote_buy(IDX_B) is None
+
+
+@pytest.mark.correctness
 def test_sell_masked_when_inventory_empty(env: AurixExchangeEnv) -> None:
     """SELL actions must be masked when the relevant inventory is empty (reset state)."""
     _, info = env.reset()
     mask = info["action_mask"]
     assert mask[SELL_BYRINIUM] == False  # noqa: E712
+
+
+@pytest.mark.correctness
+def test_sell_masked_below_meaningful_notional(env: AurixExchangeEnv) -> None:
+    """Dust liquidation must not become a no-op substitute for penalized HOLD."""
+    env.reset()
+    spot = math.exp(env._log_prices[IDX_B])
+    env._inventory[IDX_B] = 0.5 * env.cfg.min_trade_notional / spot
+    assert env._action_mask()[SELL_BYRINIUM] == False  # noqa: E712
 
 
 @pytest.mark.correctness
@@ -584,6 +687,163 @@ def test_sell_execution_price_below_spot(env: AurixExchangeEnv) -> None:
 
 
 @pytest.mark.correctness
+def test_valid_buy_spends_exact_fraction_and_matches_quote(
+    env: AurixExchangeEnv,
+) -> None:
+    """The shared quote and executor must preserve BUY = 25% of liquid cash."""
+    env.reset()
+    env._cash = 10_000.0
+    env._inventory[:] = 0.0
+    cash_before = env._cash
+    quote = env._quote_buy(IDX_B)
+    assert quote is not None
+    quoted_qty, quoted_cost = quote
+
+    env._execute_buy(IDX_B)
+
+    assert quoted_cost == pytest.approx(env.cfg.buy_fraction * cash_before)
+    assert cash_before - env._cash == pytest.approx(quoted_cost)
+    assert env._inventory[IDX_B] == pytest.approx(quoted_qty)
+    assert env._inventory[IDX_B] <= env._max_inventory[IDX_B]
+
+
+@pytest.mark.correctness
+@pytest.mark.parametrize("idx", [IDX_B, IDX_H, IDX_T])
+def test_full_capacity_liquidation_is_positive_and_matches_log_depth(
+    env: AurixExchangeEnv, idx: int
+) -> None:
+    """A legal full liquidation must never fall onto an artificial price floor."""
+    env.reset()
+    env._cash = 0.0
+    qty = env._max_inventory[idx]
+    env._inventory[idx] = qty
+    spot = math.exp(env._log_prices[idx])
+    kappa = env.cfg.impact_log_at_capacity
+    expected = (
+        (1.0 - env.cfg.brokerage_fee)
+        * spot
+        * qty
+        * (-math.expm1(-kappa) / kappa)
+    )
+
+    env._execute_sell(idx)
+    proceeds = env._cash
+
+    assert math.isfinite(proceeds)
+    assert 0.0 < proceeds < spot * qty
+    assert proceeds == pytest.approx(expected, rel=1e-12)
+    assert env._inventory[idx] == 0.0
+
+
+@pytest.mark.correctness
+@pytest.mark.parametrize("idx", [IDX_B, IDX_H, IDX_T])
+def test_sell_proceeds_increase_monotonically_to_capacity(
+    env: AurixExchangeEnv, idx: int
+) -> None:
+    """Selling more inventory must always produce more cash."""
+    env.reset()
+    proceeds = []
+    for fraction in (0.01, 0.25, 0.50, 0.75, 1.0):
+        env._inventory[:] = 0.0
+        env._inventory[idx] = fraction * env._max_inventory[idx]
+        quote = env._quote_sell(idx)
+        assert quote is not None
+        proceeds.append(quote[1])
+    assert all(right > left for left, right in zip(proceeds, proceeds[1:]))
+
+
+@pytest.mark.correctness
+def test_equal_capacity_fractions_have_equal_impact(env: AurixExchangeEnv) -> None:
+    """Commodity unit scales must not change slippage at equal depth usage."""
+    env.reset()
+    common_spot = 100.0
+    env._log_prices[:] = math.log(common_spot)
+    execution_factors = []
+    for idx in (IDX_B, IDX_H, IDX_T):
+        qty = 0.5 * env._max_inventory[idx]
+        env._inventory[:] = 0.0
+        env._inventory[idx] = qty
+        quote = env._quote_sell(idx)
+        assert quote is not None
+        execution_factors.append(quote[1] / (common_spot * qty))
+    np.testing.assert_allclose(execution_factors, execution_factors[0], rtol=1e-12)
+
+
+@pytest.mark.correctness
+def test_zero_impact_reduces_to_spot_plus_minus_fee() -> None:
+    """The kappa=0 limit must be ordinary brokerage-only accounting."""
+    cfg = EnvConfig(impact_log_at_capacity=0.0)
+    env = AurixExchangeEnv(config=cfg, seed=_SEED)
+    env.reset(seed=_SEED)
+    env._cash = 10_000.0
+    env._inventory[:] = 0.0
+    spot = math.exp(env._log_prices[IDX_B])
+
+    buy_quote = env._quote_buy(IDX_B)
+    assert buy_quote is not None
+    buy_qty, buy_cost = buy_quote
+    assert buy_cost == pytest.approx(cfg.buy_fraction * env._cash)
+    assert buy_qty == pytest.approx(buy_cost / (spot * (1.0 + cfg.brokerage_fee)))
+
+    env._inventory[IDX_B] = buy_qty
+    sell_quote = env._quote_sell(IDX_B)
+    assert sell_quote is not None
+    assert sell_quote[1] == pytest.approx(
+        buy_qty * spot * (1.0 - cfg.brokerage_fee)
+    )
+
+
+@pytest.mark.correctness
+def test_immediate_round_trip_cannot_create_cash(env: AurixExchangeEnv) -> None:
+    """Fees plus symmetric temporary impact must make a round trip strictly costly."""
+    env.reset()
+    env._cash = 10_000.0
+    env._inventory[:] = 0.0
+    cash_before = env._cash
+    buy_quote = env._quote_buy(IDX_B)
+    assert buy_quote is not None
+    quantity, buy_cost = buy_quote
+    fraction = quantity / env._max_inventory[IDX_B]
+    expected_resale = buy_cost * (
+        (1.0 - env.cfg.brokerage_fee)
+        / (1.0 + env.cfg.brokerage_fee)
+        * math.exp(-env.cfg.impact_log_at_capacity * fraction)
+    )
+    env._execute_buy(IDX_B)
+    assert env._inventory[IDX_B] > 0.0
+    sell_quote = env._quote_sell(IDX_B)
+    assert sell_quote is not None
+    assert sell_quote[1] == pytest.approx(expected_resale, rel=1e-12)
+    env._execute_sell(IDX_B)
+    assert env._cash < cash_before
+
+
+@pytest.mark.correctness
+def test_seeded_trade_quotes_preserve_ledger_bounds(env: AurixExchangeEnv) -> None:
+    """A broad state sample must produce finite quotes inside cash/capacity bounds."""
+    rng = np.random.default_rng(20260717)
+    env.reset()
+    for _ in range(200):
+        env._cash = float(rng.uniform(0.0, 100_000.0))
+        env._log_prices = env._gou_mu + rng.normal(0.0, env._sigma_stat)
+        env._inventory = rng.uniform(0.0, 1.0, size=3) * env._max_inventory
+        for idx in (IDX_B, IDX_H, IDX_T):
+            buy_quote = env._quote_buy(idx)
+            if buy_quote is not None:
+                quantity, cost = buy_quote
+                assert math.isfinite(quantity) and quantity > 0.0
+                assert math.isfinite(cost) and cost > 0.0
+                assert cost == pytest.approx(env.cfg.buy_fraction * env._cash)
+                assert env._inventory[idx] + quantity <= env._max_inventory[idx]
+
+            sell_quote = env._quote_sell(idx)
+            if sell_quote is not None:
+                quantity, proceeds = sell_quote
+                assert 0.0 < quantity <= env._max_inventory[idx]
+                assert math.isfinite(proceeds) and proceeds > 0.0
+
+
+@pytest.mark.correctness
 def test_trades_do_not_move_equilibrium_mu(env: AurixExchangeEnv) -> None:
     """Anti-self-inflation (rebalancing.md §2.1): permanent impact is removed, so
     neither a BUY nor a SELL may shift the reversion target mu (closing the exploit
@@ -698,6 +958,64 @@ def test_launch_fee_scales_with_fatigue(env: AurixExchangeEnv, cfg: EnvConfig) -
     env._fatigue = cfg.fatigue_max
     expected = cfg.launch_fee_base * (1.0 + cfg.launch_fee_fatigue_k)
     assert env._launch_fee() == pytest.approx(expected, rel=1e-9)
+
+
+def _expected_expedition_net_at_equilibrium(
+    cfg: EnvConfig, fatigue_before: float
+) -> float:
+    """Analytic one-launch value with empty capacity at equilibrium spot prices."""
+    fatigue_after = min(
+        cfg.fatigue_max,
+        fatigue_before + cfg.expedition_fatigue_gain,
+    )
+    gross = 0.0
+    for idx, weight in enumerate(cfg.expedition_weights):
+        p_base = cfg.hazard_p_base[idx]
+        hazard = p_base + (1.0 - p_base) / (
+            1.0
+            + math.exp(
+                -cfg.hazard_kappa[idx]
+                * (fatigue_after - cfg.hazard_midpoint[idx])
+            )
+        )
+        gross += (
+            weight
+            * (1.0 - hazard)
+            * cfg.expedition_harvest
+            * math.exp(cfg.gou_mu[idx])
+        )
+    fee = cfg.launch_fee_base * (
+        1.0
+        + cfg.launch_fee_fatigue_k * fatigue_before / cfg.fatigue_max
+    )
+    return gross - fee
+
+
+@pytest.mark.correctness
+def test_expedition_expected_value_makes_rest_economically_relevant(
+    cfg: EnvConfig,
+) -> None:
+    """A rested launch is tempting, but moderate fatigue must reverse its EV."""
+    rested_ev = _expected_expedition_net_at_equilibrium(cfg, fatigue_before=0.0)
+    fatigued_ev = _expected_expedition_net_at_equilibrium(
+        cfg, fatigue_before=25.0
+    )
+    assert 0.0 < rested_ev < 0.15 * cfg.launch_fee_base
+    assert fatigued_ev < 0.0
+
+
+@pytest.mark.correctness
+def test_expedition_liquidity_guard_covers_largest_eligible_fee(
+    cfg: EnvConfig,
+) -> None:
+    """Any mask-valid launch must have enough cash to pay its complete fee."""
+    largest_eligible_fee = cfg.launch_fee_base * (
+        1.0
+        + cfg.launch_fee_fatigue_k
+        * cfg.expedition_fatigue_ceiling
+        / cfg.fatigue_max
+    )
+    assert cfg.expedition_min_cash >= largest_eligible_fee
 
 
 @pytest.mark.correctness
@@ -858,12 +1176,12 @@ def test_cumulative_reward_baseline() -> None:
     """Lock cumulative reward over a fixed action sequence against a captured baseline.
 
     Generated 2026-06-04: seed=42, 10 steps alternating BUY_BYRINIUM / SELL_BYRINIUM.
-    Regenerated 2026-06-06 for the rebalancing.md alignment (new B risk-ladder
-    params: μ=ln(150), θ=0.10, σ=0.40; permanent impact removed).
+    Regenerated 2026-07-17 for the M2 stationary contract: capacity-normalized,
+    integrated log-depth impact replaces raw-unit linear liquidation impact.
     """
     # REGRESSION BASELINE — update this value intentionally if env parameters change.
     # Do not update automatically; verify the change is deliberate.
-    expected_cumulative = -0.16781596354977363
+    expected_cumulative = -0.11201103889903857
 
     env = AurixExchangeEnv(seed=_SEED)
     env.reset(seed=_SEED)

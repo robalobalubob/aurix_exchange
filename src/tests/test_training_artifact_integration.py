@@ -83,6 +83,7 @@ def test_game_dqn_writes_and_finalizes_run_artifacts(tmp_path) -> None:
         log_every=1,
         eval_every=10,
         test_episodes=2,
+        test_seed0=200_000,
         artifact_root=str(tmp_path),
         run_id="smoke",
         seed=7,
@@ -97,8 +98,13 @@ def test_game_dqn_writes_and_finalizes_run_artifacts(tmp_path) -> None:
 
     config = _read_json(run_directory / "config.json")
     manifest = _read_json(run_directory / "manifest.json")
-    assert config["training"]["test_seed0"] == 100_000
+    sidecar = _read_json(run_directory / "aurix_config.json")
+    assert config["training"]["test_seed0"] == 200_000
     assert config["environment"]["t_max"] == 200
+    assert sidecar["schema_version"] == 2
+    assert sidecar["environment_contract"] == "m2_stationary_v1"
+    assert sidecar["config"]["impact_log_at_capacity"] == 0.10
+    assert "temp_impact" not in sidecar["config"]
     assert manifest["status"] == "completed"
     assert manifest["summary"]["environment_sidecar"] == (
         "aurix_config.json"

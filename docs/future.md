@@ -51,14 +51,19 @@ $$o_t = [C_t, I_t^B, I_t^H, I_t^T, X_t^B, X_t^H, X_t^T, F_t, \tau_t, T_{\text{co
 * `Idx 1-2`: **`BUY / SELL BYRINIUM`** — Allocate 25% cash / Liquidate 100% stock.
 * `Idx 3-4`: **`BUY / SELL HERBS`** — Allocate 25% cash / Liquidate 100% stock.
 * `Idx 5-6`: **`BUY / SELL TOOLS`** — Allocate 25% cash / Liquidate 100% stock.
-* `Idx 7`: **`LAUNCH_EXPEDITION`** — Charges an upfront, fatigue-scaled launch fee paid regardless of operational outcome: $C_{\text{launch}} = \text{launch\_fee\_base} \cdot (1 + k \cdot F_t / F_{\max})$, where `launch_fee_base = 100.0` and `launch_fee_fatigue_k = 1.0` (i.e. 100.0 at zero fatigue, rising with party fatigue). **Eligibility is gated separately**: the action is masked out unless cash $\geq$ `expedition_min_cash = 200.0` *and* $T_{\text{cooldown}} = 0$. Note `expedition_min_cash` is the liquidity guardrail, not the fee.
+* `Idx 7`: **`LAUNCH_EXPEDITION`** — Charges an upfront, fatigue-scaled launch fee paid regardless of operational outcome: $C_{\text{launch}} = \text{launch\_fee\_base} \cdot (1 + k \cdot F_t / F_{\max})$, where `launch_fee_base = 800.0` and `launch_fee_fatigue_k = 1.0` (i.e. 800.0 at zero fatigue, rising with party fatigue). **Eligibility is gated separately**: the action is masked out unless cash $\geq$ `expedition_min_cash = 1600.0` *and* $T_{\text{cooldown}} = 0$. The liquidity guardrail covers every eligible fatigue-scaled fee; it is not an additional charge.
 
-### 2.3 Committed Action Masking Logic (Python)
+### 2.3 Historical Action Masking Sketch
+
+> **M2 note (2026-07-17):** The sketch below predates capacity-aware BUY quotes and
+> integrated log-depth execution. It is not deployment-parity code. The authoritative
+> contract is `src/env/aurix_env.py`, its tests, and `docs/m2_plan.md`; a future C#
+> client must implement the same quote equations and read sidecar schema version 2.
 
 ```python
 import numpy as np
 
-def get_action_mask(state, expedition_min_cash=200.0, sell_inventory_epsilon=1e-5):
+def get_action_mask(state, expedition_min_cash=1600.0, sell_inventory_epsilon=1e-5):
     """
     Computes valid boolean mask matching the committed environment logic.
     Excludes experimental curfew mechanics to maintain contract parity.
@@ -116,7 +121,8 @@ public enum GameAction : int
 }
 
 // Mirrors the nested payload written by export_config():
-//   { "obs_dim", "n_actions", "config": {...}, "derived": {...} }
+//   { "schema_version", "environment_contract", "obs_dim", "n_actions",
+//     "config": {...}, "derived": {...} }
 // Property names are snake_case to bind directly to the JSON keys.
 public class EnvParams
 {
